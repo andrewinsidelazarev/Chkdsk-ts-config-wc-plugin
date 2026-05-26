@@ -111,25 +111,27 @@ sjasmplus --sym=dbg.sym main.a80      # -> CHKDSK.WMF
 
 ## Тестирование без железа
 
-- `sim_chkdsk.py` — детерминированный Z80-харнесс: грузит `CHKDSK.WMF`, мокает API WC,
-  эмулирует Z-Controller поверх FAT32-образа и прогоняет процедуры (детект/ремонт) с
-  лимитом инструкций. Требует чистого Python-ядра Z80 от cburbridge в каталоге
-  `_z80_lib_cburbridge/` (не входит в репозиторий, см. ссылку в «Источниках»).
-- `make_test_img.py` — сгенерировать маленький тестовый FAT32-образ.
+Все отладочные/тестовые скрипты лежат в каталоге `Debug/`:
+
+- `Debug/sim_chkdsk.py` — детерминированный Z80-харнесс: грузит `CHKDSK.WMF`, мокает
+  API WC, эмулирует Z-Controller поверх FAT32-образа и прогоняет процедуры
+  (детект/ремонт) с лимитом инструкций. Требует чистого Python-ядра Z80 от cburbridge
+  в каталоге `_z80_lib_cburbridge/` в корне проекта (не входит в репозиторий, см.
+  ссылку в «Источниках»).
+- `Debug/make_test_img.py` — сгенерировать маленький тестовый FAT32-образ.
 - Скрипты внесения ошибок (с откатом `--restore`, где применимо) для проверки ремонта:
-  `make_lost_clusters.py`, `make_fat_mismatch.py`, `make_fat0_corrupt.py`,
-  `make_fat_both_bad.py`, `make_deep_errors.py`.
+  `Debug/make_lost_clusters.py`, `Debug/make_fat_mismatch.py`,
+  `Debug/make_fat0_corrupt.py`, `Debug/make_fat_both_bad.py`, `Debug/make_deep_errors.py`.
 
 ## Структура репозитория
 
 ```
 src/            исходники плагина (.a80)
 docs/           учебник (TS-Conf, FAT32, плагины WC)
+Debug/          отладка/тесты: Z80-симулятор, генератор образа, скрипты внесения ошибок
 CHKDSK.WMF      готовый собранный плагин
 build.bat       сборка + инжект в wc.img
-inject_*.py     инжектор плагина в образ wc.img
-make_*.py       генератор тестового образа и скрипты внесения ошибок
-sim_chkdsk.py   Z80-симулятор для тестов
+inject_*.py     инжектор плагина в образ wc.img (install-инструмент)
 ```
 
 ## Источники и благодарности

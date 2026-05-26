@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 here = Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location("inj", here / "inject_chkdsk_to_wc_img.py")
+spec = importlib.util.spec_from_file_location("inj", here.parent / "inject_chkdsk_to_wc_img.py")
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 

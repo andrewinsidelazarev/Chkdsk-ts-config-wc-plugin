@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE / "_z80_lib_cburbridge" / "src"))
+sys.path.insert(0, str(HERE.parent / "_z80_lib_cburbridge" / "src"))
 from z80 import instructions, registers, util  # noqa: E402
 
 RETURN_MARKER = 0xFFFE
@@ -58,7 +58,7 @@ def expected_lost(img: Path):
     """Lost allocation units (allocated - size-based-used), matching the
     plugin's cheap method (exact when files are well-formed)."""
     import importlib.util as iu
-    sp = iu.spec_from_file_location("inj", HERE / "inject_chkdsk_to_wc_img.py")
+    sp = iu.spec_from_file_location("inj", HERE.parent / "inject_chkdsk_to_wc_img.py")
     inj = iu.module_from_spec(sp); sp.loader.exec_module(inj)
     fi = inj.Fat32Image(img)
     cs = fi.spc * 512
@@ -93,7 +93,7 @@ def expected_lost(img: Path):
 def reachable_set(img: Path):
     """Set of all clusters reachable from root via dir+file chains."""
     import importlib.util as iu
-    sp = iu.spec_from_file_location("inj", HERE / "inject_chkdsk_to_wc_img.py")
+    sp = iu.spec_from_file_location("inj", HERE.parent / "inject_chkdsk_to_wc_img.py")
     inj = iu.module_from_spec(sp); sp.loader.exec_module(inj)
     fi = inj.Fat32Image(img)
     reach = set()
@@ -120,7 +120,7 @@ def reachable_set(img: Path):
 def expected_walk(img: Path):
     """Live dir-tree ground truth: (files, filebytes, dirs, dirbytes)."""
     import importlib.util as iu
-    sp = iu.spec_from_file_location("inj", HERE / "inject_chkdsk_to_wc_img.py")
+    sp = iu.spec_from_file_location("inj", HERE.parent / "inject_chkdsk_to_wc_img.py")
     inj = iu.module_from_spec(sp); sp.loader.exec_module(inj)
     fi = inj.Fat32Image(img)
     files = filebytes = dirs = dirclus = 0
@@ -262,8 +262,8 @@ class Sim:
 
 
 def main():
-    sym = parse_sym(HERE / "src" / "dbg.sym")
-    wmf = HERE / "src" / "CHKDSK.WMF"
+    sym = parse_sym(HERE.parent / "src" / "dbg.sym")
+    wmf = HERE.parent / "src" / "CHKDSK.WMF"
     ok = True
 
     # --- Test 1: fmt_dec32 (decimal formatting) ---

@@ -20,7 +20,7 @@ import importlib.util as iu
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-_sp = iu.spec_from_file_location("inj", HERE / "inject_chkdsk_to_wc_img.py")
+_sp = iu.spec_from_file_location("inj", HERE.parent / "inject_chkdsk_to_wc_img.py")
 inj = iu.module_from_spec(_sp)
 _sp.loader.exec_module(inj)
 EOC = inj.EOC

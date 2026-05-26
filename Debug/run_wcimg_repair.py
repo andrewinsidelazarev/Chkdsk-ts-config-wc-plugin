@@ -15,8 +15,8 @@ copy = HERE / "wc_repair_test.img"
 
 sp = importlib.util.spec_from_file_location("s", HERE / "sim_chkdsk.py")
 m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
-sym = m.parse_sym(HERE / "src" / "dbg.sym")
-wmf = HERE / "src" / "CHKDSK.WMF"
+sym = m.parse_sym(HERE.parent / "src" / "dbg.sym")
+wmf = HERE.parent / "src" / "CHKDSK.WMF"
 
 
 def log(s):
