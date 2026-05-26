@@ -1,0 +1,24 @@
+# образы дисков (тестовые/рабочие)
+*.img
+# сайдкары откатов скриптов внесения ошибок
+*.deepbak
+
+# артефакты сборки (готовый CHKDSK.WMF лежит в корне как релиз)
+src/CHKDSK.WMF
+src/dbg.sym
+src/*.lst
+src/*.sym
+
+# Python
+__pycache__/
+*.pyc
+
+# стороннее: клон исходников Wild Commander (см. ссылку в README)
+wc_reference/
+# стороннее: Python-ядро Z80 от cburbridge для симулятора (см. ссылку в README)
+_z80_lib_cburbridge/
+
+# рабочий мусор сессии
+exp.txt
+Безымянный.png
+Чат.txt

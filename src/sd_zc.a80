@@ -1,0 +1,229 @@
+;//////////////////////////////////////////////////////////////
+;//  sd_zc.a80 — автономный сырой доступ к SD-карте через Z-Controller (SPI).
+;//
+;//  Порт пути чтения/записи из штатного драйвера WC (DSDZC.ASM). Карта уже
+;//  проинициализирована и том смонтирован самим Wild Commander, поэтому здесь
+;//  только команды чтения/записи блоков (CMD18/CMD25) — без инициализации.
+;//
+;//  Все ожидания — ПОЛЛИНГОВЫЕ (опрос статусного байта), без задержек по тактам,
+;//  поэтому драйвер безопасен на любой частоте CPU (3.5/7/14 МГц). См. учебник §1.4.
+;//  Поддерживаются обе адресации (блочная SDHC/SDXC и байтовая SDSC) — выбор по
+;//  флагу SDBSF из глобалов WC.
+;//////////////////////////////////////////////////////////////
+
+SD_CONF		equ	#77		; порт конфигурации / выбора карты (chip-select)
+SD_DATA		equ	#57		; порт данных SPI (чтение/запись байта)
+SD_SDBSF	equ	#6015		; глобал WC (#6000+21): флаг блочной адресации
+SD_CMD18	equ	%01000000+18	; CMD18 — чтение нескольких блоков (multi-block read)
+SD_CMD25	equ	%01000000+25	; CMD25 — запись нескольких блоков (multi-block write)
+SD_CMD12	equ	%01000000+12	; CMD12 — стоп передачи (после multi-block)
+SD_CS1		equ	%00000001	; маска chip-select: выбрать карту SD1
+
+;--- sd_init: запомнить режим адресации (SDBSF: !=0 — блочная, 0 — байтовая).
+;    Поддерживаются оба режима; WC/Unreal на этом томе использует адресацию по
+;    флагу из BPB/глобала. Вызывается один раз перед работой.
+sd_init:
+	ld	a,(SD_SDBSF)
+	ld	(sd_blkt),a
+	ret
+
+;--- sd_read_sector: прочитать один сектор 512 байт.
+;    вход:  HL = LBA (младшие 16 бит), DE = LBA (старшие 16 бит)  [LBA 32-битный]
+;           IX = адрес буфера-приёмника (512 байт)
+;    выход: CF = 1 при ошибке
+sd_read_sector:
+	ld	(sd_lba+0),hl
+	ld	(sd_lba+2),de
+	push	ix
+	pop	hl			; HL = буфер-приёмник
+	ld	a,1			; счётчик секторов = 1
+	exa				; счётчик -> A'  (приём из DSDZC: счётчик переживает поллинг)
+	call	sd_cmd18
+	jr	nz,.err
+	exa				; A = счётчик
+.rd1
+	exa				; счётчик -> A' (безопасно через WTDO/READS)
+.wtok	call	sd_wtdo
+	cp	#FE
+	jr	nz,.wtok		; ждать data-token #FE (начало данных)
+	call	sd_reads		; прочитать 512 байт -> (HL), HL += 512
+	exa				; A = счётчик
+	dec	a
+	jr	nz,.rd1
+	call	sd_cmd12
+	call	sd_snb
+	call	sd_wtby
+	call	sd_csh
+	or	a			; CF=0 (успех)
+	ret
+.err	call	sd_csh
+	scf
+	ret
+
+;--- CMD18 (multi-block read). Адрес берётся из sd_lba.
+;    блочная адресация (sd_blkt!=0): аргумент = LBA (номер блока).
+;    байтовая адресация (sd_blkt==0): аргумент = LBA*512 (смещение в байтах).
+;    Сохраняет HL (указатель буфера вызывающего). Порт DSDZC CMDz.
+sd_cmd18:
+	ld	a,SD_CMD18
+sd_cmdz:				; общее тело; A = команда (CMD18 чтение / CMD25 запись)
+	call	sd_csh
+	call	sd_csl
+	push	hl			; сохранить указатель буфера
+	ld	de,(sd_lba+0)		; DE = LBA младшие 16
+	ld	bc,(sd_lba+2)		; BC = LBA старшие 16
+	ld	l,c
+	ld	h,b			; HL = старшие 16
+	ld	c,a			; C = команда
+	ld	a,(sd_blkt)
+	or	a
+	jr	nz,.send		; блочная адресация -> слать LBA как есть
+	; байтовая адресация: [HL:DE] = LBA*512  (x2, затем сдвиг на байт = x256)
+	ex	de,hl : add hl,hl
+	ex	de,hl : adc hl,hl
+	ld	h,l : ld l,d : ld d,e : ld e,a	; A здесь = sd_blkt = 0
+.send
+	ld	a,c			; A = команда
+	ld	bc,SD_DATA
+	out	(c),a			; байт команды
+	out	(c),h
+	out	(c),l
+	out	(c),d
+	out	(c),e
+	ld	a,#FF
+	out	(c),a			; CRC (игнорируется в SPI-режиме)
+	pop	hl			; восстановить указатель буфера
+	jp	sd_resp
+
+;--- CMD12 (stop) — посылается посреди транзакции multi-block
+sd_cmd12:
+	ld	a,SD_CMD12
+	push	bc
+	ld	bc,SD_DATA
+	out	(c),a
+	xor	a
+	out	(c),a : out (c),a : out (c),a : out (c),a
+	dec	a
+	out	(c),a			; CRC #FF
+	pop	bc
+	in	a,(SD_DATA)		; stuff-байт
+	jp	sd_resp
+
+;--- прочитать 512 байт из порта данных в (HL); HL += 512
+sd_reads:
+	push	bc
+	ld	bc,SD_DATA		; B=0 -> INIR гоняет 256 байт за раз
+	inir
+	inir
+	pop	bc
+	ret
+
+;--- chip select high (снять выбор карты) + такт
+sd_csh:
+	push	bc : push af
+	ld	bc,SD_CONF : ld a,%00000011 : out (c),a
+	ld	bc,SD_DATA : ld a,#FF : out (c),a
+	pop	af : pop bc
+	ret
+
+;--- chip select low (выбрать карту) + такт, затем дождаться готовности
+sd_csl:
+	push	bc : push af
+	ld	bc,SD_CONF : ld a,SD_CS1 : out (c),a
+	ld	bc,SD_DATA : ld a,#FF : out (c),a
+	pop	af : pop bc
+	jp	sd_wait
+
+;--- ждать, пока карта вернёт #FF (готова)
+sd_wait:
+	push	bc : push af
+	ld	bc,SD_DATA
+.w	in	a,(c) : inc a : jr nz,.w
+	pop	af : pop bc
+	ret
+
+;--- ждать, пока карта вернёт байт != #FF
+sd_wtdo:
+	push	bc
+	ld	bc,SD_DATA
+.w	in	a,(c) : cp #FF : jr z,.w
+	pop	bc
+	ret
+
+;--- ждать, пока карта вернёт ненулевой байт (конец занятости/busy)
+sd_wtby:
+	push	bc : push af
+	ld	bc,SD_DATA
+.w	in	a,(c) : or a : jr z,.w
+	pop	af : pop bc
+	ret
+
+;--- 16 холостых чтений (доп. такты SPI)
+sd_snb:
+	push	bc : push af
+	ld	b,16
+.s	in	a,(SD_DATA) : djnz .s
+	pop	af : pop bc
+	ret
+
+;--- прочитать R1-ответ (бит7=0), до 10 попыток
+sd_resp:
+	push	de : push bc
+	ld	bc,SD_DATA
+	ld	d,10
+.r	in	a,(c) : bit 7,a : jr z,.done
+	dec	d : jr nz,.r
+.done	pop	bc : pop de
+	ret
+
+;--- sd_write_sector: записать один сектор 512 байт (порт DSDZC SDDSE)
+;    вход: HL = LBA младшие16, DE = LBA старшие16, IX = адрес буфера-источника (512 байт)
+sd_write_sector:
+	ld	(sd_lba+0),hl
+	ld	(sd_lba+2),de
+	push	ix
+	pop	hl			; HL = буфер-источник
+	ld	a,1			; счётчик секторов = 1
+	exa
+	ld	a,SD_CMD25
+	call	sd_cmdz			; CMD25 (multi-block write)
+	call	sd_wait
+	exa
+.wr1
+	exa
+	call	sd_savds		; data-token + 512 байт + CRC
+	call	sd_dresp		; data-response + ожидание busy
+	exa
+	dec	a
+	jr	nz,.wr1
+	ld	bc,SD_DATA
+	ld	a,#FD : out (c),a	; stop-transmission token
+	call	sd_snb
+	call	sd_wtby
+	call	sd_csh
+	ret
+
+;--- послать один блок данных: токен #FC + 512 байт (из HL) + 2 байта CRC
+sd_savds:
+	push	bc
+	ld	bc,SD_DATA
+	ld	a,#FC : out (c),a	; токен начала данных
+	otir				; 256 байт (HL)->порт, HL += 256
+	otir				; ещё 256 = 512
+	ld	a,#FF : out (c),a	; CRC (фиктивный)
+	out	(c),a
+	pop	bc
+	ret
+
+;--- ждать data-response token, затем пока карта занята (busy)
+sd_dresp:
+	push	bc : push af
+	ld	bc,SD_DATA
+.w1	in	a,(c) : cp #FF : jr z,.w1	; ждать токен ответа на данные
+.w2	in	a,(c) : or a : jr z,.w2		; ждать, пока busy (карта держит 0)
+	pop	af : pop bc
+	ret
+
+;--- состояние драйвера ---
+sd_lba		ds	4		; текущий LBA (32 бита), задаётся read/write
+sd_blkt		db	0		; режим адресации: !=0 блочный, 0 байтовый (из sd_init)

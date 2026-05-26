@@ -1,0 +1,117 @@
+;//////////////////////////////////////////////////////////////
+;//  ChkDsk FAT32 — точка входа сборки и упаковка плагина (.WMF).
+;//
+;//  Этот файл собирает плагин: задаёт целевую машину, подключает заголовки и
+;//  основной код, и формирует «переходники» (thunk'и) к функциям API Wild
+;//  Commander. Готовый образ пишется в CHKDSK.WMF (см. SAVEBIN в конце).
+;//  Сборка: sjasmplus main.a80  (см. build.bat). Учебник §6.
+;//////////////////////////////////////////////////////////////
+	DEVICE ZXSPECTRUM128
+	OPT --syntax=ab			; соглашение TS-Conf: разрешить «фейковые»/многоаргументные инструкции
+
+	INCLUDE "wc_api.h.a80"		; адреса и номера функций API Wild Commander
+	INCLUDE "colors.h.a80"		; символические имена цветов для атрибутов окон
+	INCLUDE "tsconf.h.a80"		; аппаратные порты TS-Conf
+
+startCode
+	ORG #0000
+	INCLUDE "wc_header.a80"		; заголовок плагина (.WMF) лежит в начале файла, по #0000
+
+	ALIGN 512			; код начинается с границы 512-байтного блока (требование загрузчика)
+	DISP #8000			; логический адрес кода = #8000 (окно Page2), физически — сразу за заголовком
+mainStart
+	INCLUDE "chkdsk.a80"		; основной код: скан, отчёт, ремонт
+
+;---- Переходники к API: ld a,_FUNC : jp _WCAPI (собираются только если используются) ----
+; Вызов API: номер функции в A, затем JP в точку входа _WCAPI (#6006). Для функций
+; с параметром применяется приём EXA — параметр уводится в A', а в A кладётся номер
+; функции; диспетчер WC вернёт параметр обратно в A перед вызовом (учебник §6.3).
+	IFUSED PRWOW
+PRWOW:	ld a,_PRWOW			; вывести окно (структура SOW в IX)
+	jp _WCAPI
+	ENDIF
+
+	IFUSED RRESB
+RRESB:	ld a,_RRESB			; стереть окно (восстановить фон под ним)
+	jp _WCAPI
+	ENDIF
+
+	IFUSED PRSRW
+PRSRW:	ld a,_PRSRW			; печать строки в окне (HL=текст, обязан быть в #8000-#BFFF)
+	jp _WCAPI
+	ENDIF
+
+	IFUSED TXTPR
+TXTPR:	ld a,_TXTPR			; вывод многострочного текста в окне
+	jp _WCAPI
+	ENDIF
+
+	IFUSED GADRW
+GADRW:	ld a,_GADRW			; получить адрес в окне
+	jp _WCAPI
+	ENDIF
+
+	IFUSED ESC
+ESC:	ld a,_ESC			; опрос клавиши ESC
+	jp _WCAPI
+	ENDIF
+
+	IFUSED ENKE
+ENKE:	ld a,_ENKE			; опрос клавиши ENTER
+	jp _WCAPI
+	ENDIF
+
+	IFUSED LOAD512
+LOAD512: ld a,_LOAD512			; чтение 512-байтных блоков через device-driver WC
+	jp _WCAPI
+	ENDIF
+
+	IFUSED SAVE512
+SAVE512: ld a,_SAVE512			; запись 512-байтных блоков через device-driver WC
+	jp _WCAPI
+	ENDIF
+
+	IFUSED STREAM
+STREAM:	ld a,_STREAM			; #39 — поток/устройство (параметры в D/B/C)
+	jp _WCAPI
+	ENDIF
+
+	IFUSED FENTRY
+FENTRY:	ld a,_FENTRY			; #3B — найти запись (HL=флаг,имя,0); вых: Z = не найдено
+	jp _WCAPI
+	ENDIF
+
+	IFUSED GDIR
+GDIR:	ld a,_GDIR			; #3F — сделать найденный каталог активным (после FENTRY)
+	jp _WCAPI
+	ENDIF
+
+	IFUSED NXTETY2
+NXTETY2: exa				; флаги-параметр в A -> A'
+	ld a,#3A			; 58 — следующая запись каталога (runtime-индекс FUX)
+	jp _WCAPI
+	ENDIF
+
+	IFUSED NORK
+NORK:	exa				; значение-параметр в A -> A'
+	ld a,_NORK			; #0A — вывести байт как 2 hex-цифры по адресу HL
+	jp _WCAPI
+	ENDIF
+
+	IFUSED MNGC_PL
+MNGC_PL: exa				; номер страницы-параметр в A -> A'
+	xor a				; #00 — подключить страницу плагина в окно #C000
+	jp _WCAPI
+	ENDIF
+
+	IFUSED YN
+YN:	exa				; режим-параметр в A -> A'
+	ld a,_YN			; #08 — диалог OK/Cancel; вых: Z = OK, NZ = cancel
+	jp _WCAPI
+	ENDIF
+
+mainEnd
+	ENT
+
+endCode
+	SAVEBIN "CHKDSK.WMF", startCode, endCode-startCode

@@ -1,0 +1,1383 @@
+;//////////////////////////////////////////////////////////////
+;//  chkdsk.a80 — плагин ChkDsk FAT32 для Wild Commander (TS-Conf).
+;//
+;//  Основной код: проверка тома (BPB, геометрия, скан свободных кластеров,
+;//  сверка копий FAT) и ремонт (потерянные кластеры, зеркало FAT, заголовок,
+;//  bad-size, cross-link). Полное описание классов ошибок и алгоритмов — в
+;//  учебнике docs/TS-Conf_дисковая_подсистема_и_плагины_WC.md (§5).
+;//
+;//  ОДНО окно: рамка рисуется один раз (PRWOW, пустой wnd_txt), а всё содержимое
+;//  выводится через TXTPR в фиксированную позицию и обновляется на месте (прогресс
+;//  во время скана, итоговые числа после). Точка входа (PLUGIN) должна быть ПЕРВЫМ
+;//  байтом кода (WC подключает его по адресу #8000).
+;//////////////////////////////////////////////////////////////
+
+CONTENT_POS	equ	#0101		; координаты TXTPR (Y,X) для содержимого окна (внутри рамки)
+
+PLUGIN:
+	di				; защитить SPI-транзакцию от прерываний
+	call	sd_init			; запомнить режим адресации SD (блочный/байтовый)
+
+	; --- прочитать сектор 0 (загрузочный/MBR) ---
+	ld	hl,0
+	ld	de,0
+	ld	ix,sector_buf
+	call	sd_read_sector
+	jp	c,.err_read
+
+	; --- найти BPB раздела FAT32 (просмотр таблицы разделов MBR) ---
+	ld	ix,sector_buf+446
+	ld	b,4
+.pscan
+	ld	a,(ix+4)
+	cp	#0B			; тип раздела 0x0B = FAT32 (CHS)
+	jr	z,.havepart
+	cp	#0C			; тип 0x0C = FAT32 (LBA)
+	jr	z,.havepart
+	ld	de,16
+	add	ix,de
+	djnz	.pscan
+	jr	.bpb_ready		; разделов нет (superfloppy): сектор 0 и есть BPB
+
+.havepart
+	ld	a,(ix+8)  : ld (part_lba+0),a	; начальный LBA раздела (из записи MBR)
+	ld	a,(ix+9)  : ld (part_lba+1),a
+	ld	a,(ix+10) : ld (part_lba+2),a
+	ld	a,(ix+11) : ld (part_lba+3),a
+	ld	hl,(part_lba+0)
+	ld	de,(part_lba+2)
+	ld	ix,sector_buf
+	call	sd_read_sector		; прочитать BPB по началу раздела
+	jp	c,.err_read
+
+.bpb_ready
+	; --- проверить, что это похоже на BPB FAT32 ---
+	ld	a,(sector_buf+11) : or a  : jp nz,.err_nofat	; байт/сектор: младший = 0 (512)
+	ld	a,(sector_buf+12) : cp 2  : jp nz,.err_nofat	; байт/сектор: старший = 2 -> 512
+	ld	a,(sector_buf+22) : or a  : jp nz,.err_nofat	; FATSz16 = 0 (для FAT32)
+	ld	a,(sector_buf+23) : or a  : jp nz,.err_nofat
+	ei
+
+	; --- скопировать поля BPB в 32-битные переменные ---
+	ld	hl,sector_buf+36 : ld de,v_fatsz    : ld bc,4 : ldir	; размер FAT в секторах (FATSz32)
+	ld	hl,sector_buf+32 : ld de,v_totsec   : ld bc,4 : ldir	; всего секторов на томе
+	ld	hl,sector_buf+44 : ld de,v_rootclus : ld bc,4 : ldir	; кластер корневого каталога
+	ld	a,(sector_buf+13) : ld (v_spc),a			; секторов на кластер (SPC)
+	ld	a,(sector_buf+21) : ld (v_media),a			; media-дескриптор BPB (F0 removable / F8 fixed — см. учебник §2.4)
+	ld	hl,v_resv : call zero32
+	ld	a,(sector_buf+14) : ld (v_resv+0),a			; зарезервированных секторов (до FAT)
+	ld	a,(sector_buf+15) : ld (v_resv+1),a
+
+	; --- активно ли зеркалирование FAT? (бит7 ExtFlags сброшен И число FAT >= 2) ---
+	;     если бит7 выставлен — активна лишь одна FAT, и копии расходятся легально.
+	xor	a : ld (mirror_on),a
+	ld	a,(sector_buf+40) : and #80 : jr nz,.nomirror	; бит7 выставлен -> зеркалирование выкл
+	ld	a,(sector_buf+16) : cp 2 : jr c,.nomirror		; <2 копий FAT -> нечего сверять
+	ld	a,1 : ld (mirror_on),a
+.nomirror
+
+	; --- firstDataSector = numFATs*FATSz32 + reserved ---
+	ld	hl,v_firstdata : call zero32
+	ld	a,(sector_buf+16) : ld b,a : or a : jr z,.nofats	; число копий FAT
+.faloop	ld	hl,v_firstdata : ld de,v_fatsz : call add32		; + размер FAT за каждую копию
+	djnz	.faloop
+.nofats	ld	hl,v_firstdata : ld de,v_resv : call add32		; + зарезервированные
+
+	; --- dataSectors = totSec - firstData (число секторов области данных) ---
+	ld	hl,v_datasec : ld de,v_totsec    : call copy32
+	ld	hl,v_datasec : ld de,v_firstdata : call sub32
+
+	; --- clusterSize = secPerClus << 9 (размер кластера в байтах) ---
+	ld	hl,v_clussize : call zero32
+	ld	a,(sector_buf+13) : ld (v_clussize),a
+	ld	b,9
+.csl	ld	hl,v_clussize : call shl32_1 : djnz .csl		; *512
+
+	; --- totalDiskSpace = dataSectors << 9 (всего байт данных) ---
+	ld	hl,v_totspace : ld de,v_datasec : call copy32
+	ld	b,9
+.tsl	ld	hl,v_totspace : call shl32_1 : djnz .tsl
+
+	; --- totalAllocUnits = dataSectors >> log2(secPerClus) (всего кластеров) ---
+	ld	hl,v_allocunits : ld de,v_datasec : call copy32
+	ld	a,(sector_buf+13) : ld c,0			; вычислить log2(SPC)
+.l2	cp	2 : jr c,.l2d
+	srl	a : inc c : jr .l2
+.l2d	ld	a,c
+	ld	(v_log2spc),a					; запомнить log2(SPC)
+	or	a : jr z,.aud
+	ld	b,c
+.aul	ld	hl,v_allocunits : call shr32_1 : djnz .aul	; dataSectors >> log2(SPC)
+.aud
+	; clusterSize - 1 (для округления вверх ceil(размер/кластер) по каждому файлу)
+	ld	hl,v_csm1 : ld de,v_clussize : call copy32
+	ld	hl,v_csm1 : call dec32
+
+	; --- занести геометрию в отчёт и показать окно ---
+	ld	hl,v_totspace   : ld de,txt_space : ld b,11 : call fmt_dec32
+	ld	hl,v_clussize   : ld de,txt_unit  : ld b,11 : call fmt_dec32
+	ld	hl,v_allocunits : ld de,txt_units : ld b,11 : call fmt_dec32
+
+	; подготовка скана FAT
+	ld	hl,v_fatstart : ld de,part_lba     : call copy32	; начало FAT = начало раздела + reserved
+	ld	hl,v_fatstart : ld de,v_resv       : call add32
+	ld	hl,fat_base   : ld de,v_fatstart   : call copy32	; обход цепочек читает FAT0 по умолчанию
+	ld	hl,v_remain   : ld de,v_allocunits : call copy32	; число записей = totalClusters + 2
+	ld	hl,v_remain   : call inc32
+	ld	hl,v_remain   : call inc32
+	ld	hl,v_free     : call zero32
+	ld	hl,v_fatmis   : call zero32
+	ld	hl,v_cursec   : ld de,v_fatstart   : call copy32
+	; всего FAT-секторов (для прогресса) = (totalClusters+2+127) >> 7
+	ld	hl,v_fattot : ld de,v_remain : call copy32
+	ld	hl,v_fattot : ld de,c127     : call add32	; +127 для округления вверх
+	ld	b,7
+.ftsh	ld	hl,v_fattot : call shr32_1 : djnz .ftsh		; >>7 (делим на 128 записей в секторе)
+	ld	hl,v_fattot  : ld de,txt_scan_t2 : ld b,5 : call fmt_dec32
+	ld	hl,v_scanned : call zero32
+	ld	hl,v_scanned : ld de,txt_scan_n2 : ld b,5 : call fmt_dec32
+
+	ld	ix,wc_win : call PRWOW		; нарисовать рамку окна один раз
+	call	draw_scanning			; "Checking disk ... sector N of T" во время скана
+
+	; === скан FAT: подсчёт свободных кластеров (запись == 0) ===
+.fat_sec
+	ld	a,(v_scanned) : and 63 : call z,fat_progress	; обновлять прогресс каждые 64 сектора
+	di
+	ld	hl,(v_cursec) : ld de,(v_cursec+2)
+	ld	ix,sector_buf
+	call	sd_read_sector			; прочитать очередной сектор FAT0
+	ei
+	ld	hl,v_scanned : call inc32
+	; --- сверка зеркала: прочитать соответствующий сектор FAT1 и сравнить с FAT0 ---
+	ld	hl,v_fat1sec : ld de,v_cursec : call copy32
+	ld	hl,v_fat1sec : ld de,v_fatsz  : call add32	; сектор FAT1 = сектор FAT0 + FATSz32
+	di
+	ld	hl,(v_fat1sec) : ld de,(v_fat1sec+2)
+	ld	ix,fat_buf
+	call	sd_read_sector
+	ei
+	call	cmp_fat_mirror		; v_fatmis++ если сектор FAT0 != сектора FAT1
+	ld	ix,sector_buf
+	ld	b,128				; 128 записей FAT по 4 байта в секторе
+.fat_ent
+	ld	a,(ix+0) : or (ix+1) : or (ix+2) : or (ix+3)
+	jr	nz,.notfree
+	push	bc : ld hl,v_free : call inc32 : pop bc	; запись == 0 -> кластер свободен
+.notfree
+	push	bc : ld hl,v_remain : call dec32 : pop bc
+	ld	a,(v_remain) : ld hl,v_remain+1 : or (hl) : inc hl : or (hl) : inc hl : or (hl)
+	jr	z,.fat_done			; обработали все записи
+	ld	de,4 : add ix,de
+	djnz	.fat_ent
+	ld	hl,v_cursec : call inc32
+	jp	.fat_sec
+.fat_done
+	; bytesAvailable = freeClusters << (9 + log2 secPerClus)  (свободно байт)
+	ld	hl,v_bytesavail : ld de,v_free : call copy32
+	ld	a,(v_log2spc) : add a,9 : ld b,a
+.bal	ld	hl,v_bytesavail : call shl32_1 : djnz .bal
+
+	; === обход дерева каталогов (режим подсчёта) ===
+	ld	hl,v_datastart : ld de,part_lba    : call copy32	; dataStart = начало раздела + firstData
+	ld	hl,v_datastart : ld de,v_firstdata : call add32
+	xor	a : ld (walk_mode),a				; 0 = только счёт (без пометки в bitmap)
+	call	dir_walk
+.walk_done
+	; dirBytes = dirClusters << (9 + log2 secPerClus)  (байт в каталогах)
+	ld	hl,v_dirbytes : ld de,v_dirclus : call copy32
+	ld	a,(v_log2spc) : add a,9 : ld b,a
+.dbl	ld	hl,v_dirbytes : call shl32_1 : djnz .dbl
+
+	; --- потерянные кластеры = allocated - expected-used (размерный метод) ---
+	ld	hl,v_expused   : ld de,v_dirclus    : call add32	; + кластеры каталогов
+	ld	hl,v_allocated : ld de,v_allocunits : call copy32
+	ld	hl,v_allocated : ld de,v_free       : call sub32	; allocated = всего - свободно
+	ld	hl,v_lost : ld de,v_allocated : call copy32
+	ld	hl,v_lost : ld de,v_expused   : call sub32		; lost = allocated - expused
+	ld	a,(v_lost+3) : cp #10 : jr c,.lostok			; недобор (expused>alloc) -> 0
+	ld	hl,v_lost : call zero32
+.lostok
+
+	; --- занести остальные числа и перерисовать отчёт ---
+	ld	hl,v_dirbytes   : ld de,txt_dirbytes  : ld b,11 : call fmt_dec32
+	ld	hl,v_dircnt     : ld de,txt_dircnt    : ld b,5  : call fmt_dec32
+	ld	hl,v_filebytes  : ld de,txt_filebytes : ld b,11 : call fmt_dec32
+	ld	hl,v_filecnt    : ld de,txt_filecnt   : ld b,5  : call fmt_dec32
+	ld	hl,v_bytesavail : ld de,txt_avail     : ld b,11 : call fmt_dec32
+	ld	hl,v_free       : ld de,txt_aunits    : ld b,11 : call fmt_dec32
+	ld	hl,v_lost       : ld de,txt_lost      : ld b,11 : call fmt_dec32
+	ld	hl,v_fatmis     : ld de,txt_fatmis    : ld b,11 : call fmt_dec32
+	; ПРИМ.: детект cross-link/bad-size здесь НЕ запускается — это медленные
+	;        оконные проходы по всем цепочкам (минуты на большом диске), только по SPACE.
+	ld	hl,v_recovered  : call zero32
+	call	check_fat_headers			; проверить заголовки FAT0/FAT1 -> txt_fathdr (ловит «обе битые»)
+	xor	a : ld (deep_done),a			; deep check ещё не запускался -> ENTER = deep check
+	call	compose_tail				; подсказка = "ENTER = deep check  ESC = exit"
+	ld	ix,wc_win : call PRWOW			; стереть экран «Checking disk» перед полным отчётом
+	call	draw_report
+
+.wait	ei : halt				; ждать кадрового прерывания (экономим CPU)
+	call	ESC
+	jp	nz,.exit				; ESC -> выход
+	call	chk_space				; SPACE -> опциональный deep check (cross-link + bad-size)
+	jr	z,.noSP
+	call	detect_walk				; живой прогресс "Deep check: NN% [бар]"
+	ld	a,1 : ld (deep_done),a
+	call	compose_tail
+	call	draw_report
+.spw	call	chk_space : jr nz,.spw			; ждать отпускания SPACE
+	jp	.wait
+.noSP
+	call	chk_fixable
+	jr	z,.wait					; чинить нечего -> работают только SPACE / ESC
+	call	ENKE
+	jr	z,.wait					; ENTER не нажат
+	; --- ENTER: ремонт. Порядок как в dosfstools: сначала FAT-копии, потом lost,
+	;     затем bad-size, затем cross-link (учебник §5.7). ---
+	ld	a,(mirror_on) : or a : jr z,.skipmir
+	ld	a,(v_fatmis) : ld hl,v_fatmis+1 : or (hl) : inc hl : or (hl) : inc hl : or (hl)
+	jr	nz,.domir				; копии различаются -> ремонт
+	ld	a,(first_ok) : ld hl,second_ok : and (hl)
+	jr	nz,.skipmir				; оба заголовка валидны и расхождений нет -> пропустить
+.domir	call	repair_fat_mirror			; скопировать хорошую FAT поверх плохой, либо реконструировать заголовок (если обе битые)
+	ld	hl,v_fatmis : call zero32
+.skipmir
+	; --- освободить потерянные кластеры (уже по согласованной FAT0) ---
+	ld	a,(v_lost) : ld hl,v_lost+1 : or (hl) : inc hl : or (hl) : inc hl : or (hl)
+	jr	z,.skiplost
+	call	repair_lost				; обнуляет осиротевшие записи в FAT0 + FAT1
+	ld	a,(repair_aborted) : or a : jr nz,.skiplost	; прерван (переполнение очереди) -> ничего не освобождено
+	ld	hl,v_lost : call zero32
+	; свободные units += освобождённые;  bytesAvailable = free << (9 + log2 spc)
+	ld	hl,v_free : ld de,v_recovered : call add32
+	ld	hl,v_bytesavail : ld de,v_free : call copy32
+	ld	a,(v_log2spc) : add a,9 : ld b,a
+.rab	ld	hl,v_bytesavail : call shl32_1 : djnz .rab
+	ld	hl,v_free       : ld de,txt_aunits : ld b,11 : call fmt_dec32
+	ld	hl,v_bytesavail : ld de,txt_avail  : ld b,11 : call fmt_dec32
+.skiplost
+	; --- ремонт bad-size (размер в каталоге = длина цепочки) — только после deep check ---
+	ld	a,(v_sizemis) : ld hl,v_sizemis+1 : or (hl) : inc hl : or (hl) : inc hl : or (hl)
+	jr	z,.skipsize
+	call	repair_size
+	ld	hl,v_sizemis : call zero32		; все bad-size приведены к согласию (compose_tail покажет 0)
+.skipsize
+	; --- ремонт cross-link (обрезать второго претендента) — только после deep check ---
+	ld	a,(v_xlink) : ld hl,v_xlink+1 : or (hl) : inc hl : or (hl) : inc hl : or (hl)
+	jr	z,.skipxl
+	call	repair_xlink
+	ld	hl,v_xlink : call zero32			; cross-link сняты (compose_tail покажет 0)
+.skipxl
+	ld	hl,v_lost      : ld de,txt_lost   : ld b,11 : call fmt_dec32
+	ld	hl,v_fatmis    : ld de,txt_fatmis : ld b,11 : call fmt_dec32
+	call	check_fat_headers			; перепроверить заголовки после ремонта -> обновить txt_fathdr
+	call	compose_tail				; "N recovered", если было; подсказка -> ESC
+	call	draw_report
+	jp	.wait
+.exit
+	ld	ix,wc_win : call RRESB			; стереть окно (восстановить фон)
+	xor	a
+	ret
+
+.err_read
+	ld	hl,txt_e_read				; ошибка чтения SD
+	jr	.err_show
+.err_nofat
+	ld	hl,txt_e_nofat				; не FAT32 / BPB не найден
+.err_show
+	ei
+	ld	(wc_err+16),hl
+	ld	ix,wc_err
+	call	PRWOW
+.ewait	ei : halt
+	call	ESC
+	jr	z,.ewait				; ждать ESC
+	ld	ix,wc_err : call RRESB
+	xor	a
+	ret
+
+;---------------------------------------------------------------
+; draw_report — отрисовать всё содержимое отчёта в позиции CONTENT_POS
+;---------------------------------------------------------------
+draw_report:
+	push	bc : push de : push hl
+	ld	ix,wc_win
+	ld	hl,txt_wnd
+	ld	de,CONTENT_POS
+	call	TXTPR
+	pop	hl : pop de : pop bc
+	ret
+
+;---------------------------------------------------------------
+; draw_scanning — экран ожидания "Checking disk ... sector N of T"
+;---------------------------------------------------------------
+draw_scanning:
+	push	bc : push de : push hl
+	ld	ix,wc_win
+	ld	hl,txt_scanning
+	ld	de,CONTENT_POS
+	call	TXTPR
+	pop	hl : pop de : pop bc
+	ret
+
+;---------------------------------------------------------------
+; fat_progress — обновить счётчик просканированных секторов и перерисовать
+;---------------------------------------------------------------
+fat_progress:
+	push	bc : push de : push hl
+	ld	hl,v_scanned : ld de,txt_scan_n2 : ld b,5 : call fmt_dec32
+	call	draw_scanning
+	pop	hl : pop de : pop bc
+	ret
+
+;---------------------------------------------------------------
+; cmp_fat_mirror — сравнить sector_buf (сектор FAT0) с fat_buf (сектор FAT1);
+;   при различии увеличить v_fatmis (счётчик различающихся секторов зеркала).
+;---------------------------------------------------------------
+cmp_fat_mirror:
+	ld	hl,sector_buf : ld de,fat_buf
+	ld	b,0					; B=0 -> 256 итераций
+.c1	ld	a,(de) : cp (hl) : jr nz,.diff
+	inc	hl : inc de : djnz .c1			; первые 256 байт
+	ld	b,0
+.c2	ld	a,(de) : cp (hl) : jr nz,.diff
+	inc	hl : inc de : djnz .c2			; вторые 256 байт = 512
+	ret
+.diff	ld	hl,v_fatmis : call inc32
+	ret
+
+;---------------------------------------------------------------
+; dir_walk — обход дерева каталогов от корня в ширину (BFS). Всегда считает
+;   файлы/каталоги; при walk_mode!=0 ещё и помечает достижимые кластеры в оконном
+;   bitmap (кластеры каталогов — здесь, цепочки файлов — в parse_dir_sector).
+;   Режимы (walk_mode): 0 счёт, 1 пометка достижимых, 2 детект cross-link+bad-size,
+;   3 ремонт bad-size (без bitmap), 4 ремонт cross-link.
+;---------------------------------------------------------------
+dir_walk:
+	ld	hl,v_filecnt   : call zero32
+	ld	hl,v_filebytes : call zero32
+	ld	hl,v_dircnt    : call zero32
+	ld	hl,v_dirclus   : call zero32
+	ld	hl,v_expused   : call zero32
+	xor	a : ld (q_head),a : ld (q_tail),a	; очистить очередь BFS
+	ld	hl,v_rootclus : ld de,v_tmp : ld bc,4 : ldir
+	call	enqueue					; поставить в очередь корневой каталог
+.bfs
+	ld	a,(q_head) : ld hl,q_tail : cp (hl) : ret z	; очередь пуста -> конец обхода
+	call	dequeue
+	ld	hl,v_curclus : ld de,v_curdir : call copy32
+.chain
+	ld	hl,v_dirclus : call inc32
+	ld	a,(v_dirclus+2) : or a : ret nz		; >64K кластеров каталогов -> стоп (защита)
+	ld	a,(v_dirclus+3) : or a : ret nz
+	ld	a,(walk_mode) : or a : jr z,.nm
+	ld	a,(walk_mode) : cp 3 : jr z,.dcnt	; режим 3: без bitmap, только счёт прогресса
+	ld	hl,v_markclus : ld de,v_curclus : call copy32
+	ld	hl,v_bmc : ld de,v_markclus : call copy32
+	ld	a,(walk_mode) : cp 2 : jr z,.dxl
+	call	bm_set					; режим 1: пометить достижимым
+	jr	.dcnt
+.dxl	call	bm_mark_xlink				; режим 2: детект двойного claim'а
+.dcnt	ld	hl,v_dscan : call inc32			; учесть кластер каталога в прогрессе
+.nm
+	; вычислить LBA первого сектора кластера каталога: dataStart + (clus-2)*SPC
+	ld	hl,v_clussec : ld de,v_curclus : call copy32
+	ld	hl,v_clussec : ld de,c2 : call sub32
+	ld	a,(v_log2spc) : or a : jr z,.noshl
+	ld	b,a
+.csl2	ld	hl,v_clussec : call shl32_1 : djnz .csl2	; *(SPC)
+.noshl	ld	hl,v_clussec : ld de,v_datastart : call add32
+	ld	a,(v_spc) : ld (cl_seccnt),a		; секторов в кластере осталось обработать
+.clsec
+	di
+	ld	hl,(v_clussec) : ld de,(v_clussec+2)
+	ld	ix,sector_buf
+	call	sd_read_sector				; прочитать сектор каталога
+	ei
+	call	parse_dir_sector		; CF=1 если встретился конец каталога
+	push	af
+	ld	a,(ds_dirty) : or a : call nz,writeback_dir	; режим 3/4 правил запись -> сбросить сектор на диск
+	pop	af
+	jr	c,.next_dir
+	ld	hl,v_clussec : call inc32
+	ld	hl,cl_seccnt : dec (hl) : jr nz,.clsec	; следующий сектор того же кластера
+	call	read_fat_next				; перейти по цепочке к следующему кластеру каталога
+	jr	c,.next_dir
+	jp	.chain
+.next_dir
+	jp	.bfs
+
+;---------------------------------------------------------------
+; parse_dir_sector — обработать 16 записей каталога в sector_buf.
+;   Считает файлы (+байты) и каталоги (подкаталоги ставит в очередь BFS).
+;   В режимах 3/4 чинит запись каталога (размер/первый кластер) и ставит ds_dirty.
+;   Вых: CF=1 если встречена запись 0x00 (конец каталога).
+;---------------------------------------------------------------
+parse_dir_sector:
+	xor	a : ld (ds_dirty),a		; на сектор: ставится, если запись была отремонтирована (режимы 3/4)
+	ld	ix,sector_buf
+	ld	b,16
+.pe	ld	a,(ix+0) : or a : jp z,.enddir		; 0x00 -> конец каталога
+	cp	#E5 : jp z,.pnext			; удалённая запись
+	ld	a,(ix+11) : cp #0F : jp z,.pnext	; запись длинного имени (LFN)
+	bit	3,a : jp nz,.pnext			; метка тома
+	bit	4,a : jp nz,.pdir			; каталог
+	; --- файл ---
+	push	bc
+	ld	hl,v_filecnt : call inc32
+	ld	a,(ix+28) : ld (v_tmp+0),a		; размер файла из записи (смещение 28..31)
+	ld	a,(ix+29) : ld (v_tmp+1),a
+	ld	a,(ix+30) : ld (v_tmp+2),a
+	ld	a,(ix+31) : ld (v_tmp+3),a
+	ld	hl,v_filebytes : ld de,v_tmp : call add32
+	; expused += ceil(size / clusterSize)  (у корректного файла длина цепочки == этому)
+	ld	hl,v_tmp2 : ld de,v_tmp  : call copy32
+	ld	hl,v_tmp2 : ld de,v_csm1 : call add32	; + (clusterSize-1) для округления вверх
+	ld	a,(v_log2spc) : add a,9 : ld b,a
+.fcsh	ld	hl,v_tmp2 : call shr32_1 : djnz .fcsh	; >> (9+log2spc) = / clusterSize
+	ld	hl,v_expused : ld de,v_tmp2 : call add32
+	ld	hl,v_explen  : ld de,v_tmp2 : call copy32	; ожидаемая длина цепочки этого файла
+	; пройти цепочку файла (режим 1 = пометить достижимым; 2 = детект cross-link + bad-size)
+	ld	a,(walk_mode) : or a : jp z,.nfm		; режим счёта -> цепочку не ходим
+	ld	a,(ix+26) : ld (v_markclus+0),a		; первый кластер файла (мл.слово в 26-27, ст.слово в 20-21)
+	ld	a,(ix+27) : ld (v_markclus+1),a
+	ld	a,(ix+20) : ld (v_markclus+2),a
+	ld	a,(ix+21) : ld (v_markclus+3),a
+	push	ix : call follow_chain : pop ix
+	; --- режим 4: ремонт cross-link (цепочка уже обрезана внутри follow_chain) ---
+	ld	a,(walk_mode) : cp 4 : jr nz,.notfix4
+	ld	a,(v_xlfound) : or a : jp z,.nfm		; этот файл не cross-linked
+	push	ix : ld hl,v_xlinkfixed : call inc32 : pop ix
+	ld	a,(v_xlempty) : or a : jr z,.xl4sz
+	xor	a					; общий кластер — первый -> опустошить файл
+	ld	(ix+20),a : ld (ix+21),a : ld (ix+26),a : ld (ix+27),a	; первый кластер = 0
+	ld	(ix+28),a : ld (ix+29),a : ld (ix+30),a : ld (ix+31),a	; размер = 0
+	ld	a,1 : ld (ds_dirty),a
+	jp	.nfm
+.xl4sz	ld	hl,v_tmp2 : ld de,v_chainlen : call copy32	; размер = (оставшаяся) длина цепочки * clusterSize
+	ld	a,(v_log2spc) : add a,9 : ld b,a
+.x4sh	ld	hl,v_tmp2 : call shl32_1 : djnz .x4sh
+	ld	a,(v_tmp2+0) : ld (ix+28),a
+	ld	a,(v_tmp2+1) : ld (ix+29),a
+	ld	a,(v_tmp2+2) : ld (ix+30),a
+	ld	a,(v_tmp2+3) : ld (ix+31),a
+	ld	a,1 : ld (ds_dirty),a
+	jp	.nfm
+.notfix4
+	; --- режим 3: ремонт bad-size (размер в каталоге = chainlen * clusterSize) ---
+	ld	a,(walk_mode) : cp 3 : jr nz,.notfix3
+	ld	hl,v_chainlen : ld de,v_explen : call cmp4
+	jp	z,.nfm						; уже согласовано (размер == цепочке)
+	ld	hl,v_tmp2 : ld de,v_chainlen : call copy32	; новый размер = chainlen << (9+log2spc)
+	ld	a,(v_log2spc) : add a,9 : ld b,a
+.fxsh	ld	hl,v_tmp2 : call shl32_1 : djnz .fxsh
+	ld	a,(v_tmp2+0) : ld (ix+28),a
+	ld	a,(v_tmp2+1) : ld (ix+29),a
+	ld	a,(v_tmp2+2) : ld (ix+30),a
+	ld	a,(v_tmp2+3) : ld (ix+31),a
+	ld	a,1 : ld (ds_dirty),a
+	push	ix : ld hl,v_sizefixed : call inc32 : pop ix	; счётчик исправленных размеров
+	jp	.nfm
+.notfix3
+	; длина цепочки != ceil(размер/кластер) ?  (режим детекта, только в первом окне)
+	ld	a,(walk_mode) : cp 2 : jp nz,.nfm
+	ld	a,(detect_w0) : or a : jp z,.nfm
+	ld	hl,v_chainlen : ld de,v_explen : call cmp4
+	jp	z,.nfm
+	push	ix : ld hl,v_sizemis : call inc32 : pop ix	; счётчик файлов с bad-size
+.nfm
+	pop	bc
+	jp	.pnext
+.pdir
+	ld	a,(ix+0) : cp '.' : jr z,.pnext		; пропустить "." и ".."
+	push	bc
+	ld	hl,v_dircnt : call inc32
+	ld	a,(ix+26) : ld (v_tmp+0),a		; первый кластер подкаталога (мл. слово)
+	ld	a,(ix+27) : ld (v_tmp+1),a
+	ld	a,(ix+20) : ld (v_tmp+2),a		; (ст. слово)
+	ld	a,(ix+21) : ld (v_tmp+3),a
+	call	enqueue					; поставить подкаталог в очередь BFS
+	pop	bc
+.pnext
+	ld	de,32 : add ix,de
+	dec	b : jp nz,.pe			; (тело цикла > 128 байт, djnz не достанет)
+	or	a					; CF=0, не конец каталога
+	ret
+.enddir
+	scf
+	ret
+
+;---------------------------------------------------------------
+; enqueue — добавить (v_tmp, 4 байта) в очередь BFS (ёмкость MAXDIRS)
+; dequeue — извлечь queue[head] в v_curdir
+;---------------------------------------------------------------
+; Кольцевой буфер (число слотов — степень двойки, индекс маскируется MAXDIRS-1).
+; Ёмкость MAXDIRS-1 одновременных каталогов. При переполнении ставим q_overflow и
+; теряем элемент — тогда repair_lost ОТКАЗЫВАЕТСЯ что-либо освобождать (неполная
+; карта достижимости иначе удалила бы живые файлы). НИКОГДА не делать его линейным.
+	IFNDEF MAXDIRS
+MAXDIRS	equ	256			; харнесс переопределяет -DMAXDIRS=N для теста переполнения
+	ENDIF
+enqueue:
+	ld	a,(q_tail) : inc a : and MAXDIRS-1	; следующий хвост (с заворотом)
+	ld	hl,q_head : cp (hl) : jr z,.qfull	; следующий == голова -> кольцо заполнено
+	ld	a,(q_tail)
+	ld	l,a : ld h,0 : add hl,hl : add hl,hl	; *4 (запись 4 байта)
+	ld	de,queue_buf : add hl,de : ex de,hl	; DE = приёмник
+	ld	hl,v_tmp : ld bc,4 : ldir
+	ld	a,(q_tail) : inc a : and MAXDIRS-1 : ld (q_tail),a
+	ret
+.qfull	ld	a,1 : ld (q_overflow),a			; дерево шире кольца -> ремонт небезопасен
+	ret
+dequeue:
+	ld	a,(q_head)
+	ld	l,a : ld h,0 : add hl,hl : add hl,hl
+	ld	de,queue_buf : add hl,de			; HL = источник
+	ld	de,v_curdir : ld bc,4 : ldir
+	ld	a,(q_head) : inc a : and MAXDIRS-1 : ld (q_head),a
+	ret
+
+;---------------------------------------------------------------
+; read_fat_next — v_curclus = FAT[v_curclus] (переход по цепочке каталога)
+;   Вых: CF=1 если EOC/невалидно (стоп цепочки), CF=0 если есть следующий кластер
+;---------------------------------------------------------------
+read_fat_next:
+	ld	hl,v_tmp : ld de,v_curclus : call copy32	; tmp = curclus >> 7  (индекс FAT-сектора)
+	ld	b,7
+.rf1	ld	hl,v_tmp : call shr32_1 : djnz .rf1
+	ld	hl,v_tmp : ld de,fat_base : call add32		; + база активной FAT (FAT0 обычно; FAT1 при проверке здоровья)
+	di
+	ld	hl,(v_tmp) : ld de,(v_tmp+2)
+	ld	ix,sector_buf
+	call	sd_read_sector
+	ei
+	ld	a,(v_curclus) : and 127			; смещение записи = (curclus & 127) * 4
+	ld	l,a : ld h,0 : add hl,hl : add hl,hl
+	ld	de,sector_buf : add hl,de		; HL = &запись
+	ld	de,v_curclus : ld bc,4 : ldir		; v_curclus = запись FAT
+	ld	a,(v_curclus+3) : and #0F : ld (v_curclus+3),a	; значащие младшие 28 бит
+	; EOC ? (>= 0x0FFFFFF8)
+	ld	a,(v_curclus+3) : cp #0F : jr nz,.nEOC
+	ld	a,(v_curclus+2) : cp #FF : jr nz,.nEOC
+	ld	a,(v_curclus+1) : cp #FF : jr nz,.nEOC
+	ld	a,(v_curclus+0) : cp #F8 : jr c,.nEOC
+	scf : ret					; EOC (конец цепочки)
+.nEOC
+	; < 2 ? -> невалидно
+	ld	a,(v_curclus+1) : or a : jr nz,.ok
+	ld	a,(v_curclus+2) : or a : jr nz,.ok
+	ld	a,(v_curclus+3) : or a : jr nz,.ok
+	ld	a,(v_curclus+0) : cp 2 : jr nc,.ok
+	scf : ret					; кластер < 2 (невалидно)
+.ok	or	a					; CF=0 (есть следующий кластер)
+	ret
+
+;---------------------------------------------------------------
+; detect_walk — только чтение: подсчёт перекрёстно-связанных кластеров (v_xlink)
+;   и файлов, у которых длина цепочки != ceil(размер/кластер) (v_sizemis).
+;   Оконный, как ремонт (bitmap «владения» ловит двойной claim в пределах окна);
+;   сверка длины-vs-размера — только в первом окне. Порт логики dosfstools check.c.
+;---------------------------------------------------------------
+detect_walk:
+	ld	hl,s_checking : ld (prog_lbl),hl		; метка прогресса ("Deep check:")
+	ld	a,1 : ld (prog_hasm),a
+	ld	a,1 : ld (prog_swap),a				; страница bitmap будет в #C000 -> редрав свопает экран
+	xor	a : ld (q_overflow),a
+	ld	hl,v_xlink   : call zero32
+	ld	hl,v_sizemis : call zero32
+	ld	hl,v_dscan   : call zero32
+	; знаменатель прогресса = достижимые кластеры * число окон
+	ld	hl,v_reach  : ld de,v_allocated : call copy32
+	ld	hl,v_reach  : ld de,v_lost      : call sub32	; reachable = allocated - lost
+	ld	hl,v_dtotal : call zero32
+	ld	hl,v_winlo  : call zero32
+.cntw	ld	hl,v_tmp : ld de,v_allocunits : call copy32
+	ld	hl,v_tmp : call inc32
+	ld	hl,v_tmp : ld de,v_winlo : call sub32
+	ld	a,(v_tmp+3) : cp #10 : jr nc,.cntdone
+	ld	hl,v_dtotal : ld de,v_reach : call add32		; += reachable за каждое окно
+	ld	hl,v_winlo : ld de,c_window : call add32
+	jr	.cntw
+.cntdone
+	ld	a,1 : ld (detect_w0),a			; в первом окне делаются проверки размера
+	ld	hl,v_winlo : call zero32
+	call	prog_units				; v_dtotal финализирован -> единицы процента/бара
+	ld	a,BM_PAGE : call MNGC_PL			; подключить 16-КБ bitmap в #C000 на время обхода
+.win
+	ld	hl,v_tmp : ld de,v_allocunits : call copy32
+	ld	hl,v_tmp : call inc32
+	ld	hl,v_tmp : ld de,v_winlo : call sub32
+	ld	a,(v_tmp+3) : cp #10 : jr nc,.done	; winlo за последним кластером -> готово
+	ld	hl,v_fatcache : ld (hl),#FF : inc hl : ld (hl),#FF : inc hl : ld (hl),#FF : inc hl : ld (hl),#FF
+	call	bm_clear
+	ld	a,2 : ld (walk_mode),a
+	call	dir_walk				; пометка+детект в пределах этого окна
+	xor	a : ld (walk_mode),a
+	ld	(detect_w0),a				; в последующих окнах — только cross-link
+	ld	hl,v_winlo : ld de,c_window : call add32
+	jp	.win
+.done
+	ld	a,SCR_PAGE : call MNGC_PL		; вернуть текстовый экран WC в #C000
+	ret
+
+;---------------------------------------------------------------
+; repair_size — один проход по дереву (walk_mode 3, БЕЗ bitmap): для каждого файла
+;   с длиной цепочки != ceil(размер/кластер) выставить размер в каталоге =
+;   chainLen * clusterSize (цепочка — авторитет). Трогает ТОЛЬКО записи каталога,
+;   FAT не меняет -> кластеры не освобождаются, полностью безопасно.
+;   v_sizefixed = число исправленных файлов. Экран остаётся в #C000 (prog_swap=0).
+;---------------------------------------------------------------
+repair_size:
+	ld	hl,s_fixsize : ld (prog_lbl),hl
+	ld	a,1 : ld (prog_hasm),a
+	xor	a : ld (prog_swap),a			; bitmap НЕ замаплен -> редрав НЕ должен свопать страницы
+	ld	hl,v_dscan    : call zero32
+	ld	hl,v_sizefixed : call zero32
+	; знаменатель прогресса = достижимые кластеры (один проход)
+	ld	hl,v_dtotal : ld de,v_allocated : call copy32
+	ld	hl,v_dtotal : ld de,v_lost      : call sub32
+	ld	a,(v_dtotal+3) : cp #10 : jr c,.dtok	; недобор -> взять всего кластеров
+	ld	hl,v_dtotal : ld de,v_allocunits : call copy32
+.dtok	call	prog_units
+	call	prog_redraw				; 0%
+	ld	a,3 : ld (walk_mode),a
+	call	dir_walk
+	xor	a : ld (walk_mode),a
+	call	prog_redraw				; финальные 100%
+	ret
+
+;---------------------------------------------------------------
+; repair_xlink — оконный проход (walk_mode 4), снимающий cross-link: первая
+;   цепочка, занявшая кластер, его сохраняет; любая следующая, наткнувшаяся на
+;   него, обрезается в предыдущем кластере (FAT->EOC, размер в каталоге правится;
+;   если общий кластер был первым — файл опустошается). Best-effort: второй файл
+;   может потерять хвост. Окна/bitmap как у detect_walk (prog_swap=1). v_xlinkfixed = счётчик.
+;---------------------------------------------------------------
+repair_xlink:
+	ld	hl,s_fixxl : ld (prog_lbl),hl
+	ld	a,1 : ld (prog_hasm),a
+	ld	a,1 : ld (prog_swap),a			; bitmap в #C000 -> редрав свопает экран
+	xor	a : ld (q_overflow),a
+	ld	hl,v_xlinkfixed : call zero32
+	ld	hl,v_dscan : call zero32
+	; знаменатель прогресса = достижимые * число окон (как в detect)
+	ld	hl,v_reach  : ld de,v_allocated : call copy32
+	ld	hl,v_reach  : ld de,v_lost      : call sub32
+	ld	hl,v_dtotal : call zero32
+	ld	hl,v_winlo  : call zero32
+.cntw	ld	hl,v_tmp : ld de,v_allocunits : call copy32
+	ld	hl,v_tmp : call inc32
+	ld	hl,v_tmp : ld de,v_winlo : call sub32
+	ld	a,(v_tmp+3) : cp #10 : jr nc,.cntd
+	ld	hl,v_dtotal : ld de,v_reach : call add32
+	ld	hl,v_winlo : ld de,c_window : call add32
+	jr	.cntw
+.cntd	ld	hl,v_winlo : call zero32
+	call	prog_units
+	ld	a,BM_PAGE : call MNGC_PL			; подключить 16-КБ bitmap владения в #C000
+.win	ld	hl,v_tmp : ld de,v_allocunits : call copy32
+	ld	hl,v_tmp : call inc32
+	ld	hl,v_tmp : ld de,v_winlo : call sub32
+	ld	a,(v_tmp+3) : cp #10 : jr nc,.done	; winlo за последним кластером -> готово
+	ld	hl,v_fatcache : ld (hl),#FF : inc hl : ld (hl),#FF : inc hl : ld (hl),#FF : inc hl : ld (hl),#FF
+	call	bm_clear
+	ld	a,4 : ld (walk_mode),a
+	call	dir_walk				; «присвоить» + обрезать в пределах окна
+	xor	a : ld (walk_mode),a
+	ld	hl,v_winlo : ld de,c_window : call add32
+	jp	.win
+.done	ld	a,SCR_PAGE : call MNGC_PL		; вернуть текстовый экран WC в #C000
+	ret
+
+;---------------------------------------------------------------
+; writeback_dir — сбросить sector_buf обратно в текущий сектор каталога (v_clussec).
+;   Вызывается из dir_walk, когда ремонт (режим 3/4) изменил запись.
+;---------------------------------------------------------------
+writeback_dir:
+	di
+	ld	hl,(v_clussec) : ld de,(v_clussec+2) : ld ix,sector_buf : call sd_write_sector
+	ei
+	ret
+
+;---------------------------------------------------------------
+; repair_lost - освободить каждый потерянный (занятый и недостижимый) кластер.
+;   Оконный: в каждом окне пометить достижимые (dir_walk в режиме 1), затем
+;   освободить занятые-но-недостижимые, записав обе копии FAT. Счётчик в v_recovered.
+;---------------------------------------------------------------
+repair_lost:
+	ld	hl,s_repairing : ld (prog_lbl),hl		; метка "Repairing: <проц> <бар>"
+	ld	a,1 : ld (prog_hasm),a				; показывать процент + бар
+	ld	a,1 : ld (prog_swap),a				; страница bitmap будет в #C000 -> редрав свопает экран
+	xor	a : ld (q_overflow),a : ld (repair_aborted),a
+	ld	hl,v_dscan : call zero32
+	ld	hl,v_recovered : call zero32
+	; знаменатель прогресса M = (достижимые + FAT-секторов-на-окно) * число_окон
+	ld	hl,v_reach : ld de,v_allocated : call copy32
+	ld	hl,v_reach : ld de,v_lost      : call sub32	; reachable = allocated - lost
+	ld	hl,v_reach : ld de,c_freesec   : call add32	; + FAT-секторов скана на окно
+	ld	hl,v_dtotal : call zero32
+	ld	hl,v_winlo  : call zero32
+.mtot	ld	hl,v_tmp : ld de,v_allocunits : call copy32
+	ld	hl,v_tmp : call inc32
+	ld	hl,v_tmp : ld de,v_winlo : call sub32
+	ld	a,(v_tmp+3) : cp #10 : jr nc,.mtotd
+	ld	hl,v_dtotal : ld de,v_reach : call add32
+	ld	hl,v_winlo : ld de,c_window : call add32
+	jr	.mtot
+.mtotd	ld	hl,v_winlo : call zero32
+	call	prog_units					; v_dtotal финализирован -> единицы процента/бара
+	ld	a,BM_PAGE : call MNGC_PL				; подключить 16-КБ bitmap в #C000 на время обхода
+.win
+	; готово, когда winlo > totalClusters+1
+	ld	hl,v_tmp : ld de,v_allocunits : call copy32
+	ld	hl,v_tmp : call inc32				; totalClusters+1
+	ld	hl,v_tmp : ld de,v_winlo : call sub32
+	ld	a,(v_tmp+3) : cp #10 : jr nc,.done		; winlo > последнего кластера -> готово
+	; сбросить кэш FAT (в прошлом окне free мог его перезаписать)
+	ld	hl,v_fatcache : ld (hl),#FF : inc hl : ld (hl),#FF : inc hl : ld (hl),#FF : inc hl : ld (hl),#FF
+	call	bm_clear
+	ld	a,1 : ld (walk_mode),a
+	call	dir_walk					; пометить достижимые кластеры этого окна
+	xor	a : ld (walk_mode),a
+	; БЕЗОПАСНОСТЬ: если очередь каталогов переполнилась, карта достижимости НЕПОЛНАЯ.
+	; Освобождение сейчас удалило бы живые файлы -> прерываем без записи.
+	ld	a,(q_overflow) : or a : jr nz,.abort
+	call	free_window
+	ld	hl,v_winlo : ld de,c_window : call add32
+	jp	.win
+.done
+	ld	a,SCR_PAGE : call MNGC_PL			; вернуть текстовый экран WC в #C000
+	ret
+.abort
+	ld	a,1 : ld (repair_aborted),a
+	ld	a,SCR_PAGE : call MNGC_PL			; вернуть экран перед возвратом
+	ret
+
+;---------------------------------------------------------------
+; free_window - в пределах [winlo, winlo+WINDOW): обнулить запись FAT
+;   (в FAT0 и FAT1) каждого занятого, валидного, не-bad, недостижимого
+;   кластера; v_recovered += количество освобождённых.
+;---------------------------------------------------------------
+free_window:
+	; первый FAT-сектор = fatstart + (winlo>>7); его первый кластер = (winlo>>7)<<7
+	ld	hl,v_fwsec : ld de,v_winlo : call copy32
+	ld	b,7
+.s1	ld	hl,v_fwsec : call shr32_1 : djnz .s1
+	ld	hl,v_fwclus : ld de,v_fwsec : call copy32
+	ld	b,7
+.s2	ld	hl,v_fwclus : call shl32_1 : djnz .s2
+	ld	hl,v_fwsec : ld de,v_fatstart : call add32
+	ld	hl,WINDOW_CLUSTERS / 128 : ld (fw_seccnt),hl	; FAT-секторов в этом окне
+.floop
+	ld	hl,v_dscan : call inc32				; продвинуть прогресс (счёт FAT-секторов)
+	ld	a,(v_dscan) : and 15 : call z,prog_redraw	; редрав каждые 16 FAT-секторов
+	di
+	ld	hl,(v_fwsec) : ld de,(v_fwsec+2)
+	ld	ix,sector_buf
+	call	sd_read_sector
+	ei
+	xor	a : ld (fw_dirty),a
+	ld	hl,v_fwc : ld de,v_fwclus : call copy32
+	ld	ix,sector_buf
+	ld	b,128
+.fent
+	ld	a,(ix+0) : or (ix+1) : or (ix+2) : or (ix+3) : jp z,.fnext	; уже свободен
+	; кластер >= 2 ?
+	ld	a,(v_fwc+1) : or a : jr nz,.ge2
+	ld	a,(v_fwc+2) : or a : jr nz,.ge2
+	ld	a,(v_fwc+3) : or a : jr nz,.ge2
+	ld	a,(v_fwc) : cp 2 : jp c,.fnext				; кластеры 0/1 зарезервированы
+.ge2
+	; кластер <= totalClusters+1 ?
+	push	bc
+	ld	hl,v_tmp : ld de,v_allocunits : call copy32
+	ld	hl,v_tmp : call inc32
+	ld	hl,v_tmp : ld de,v_fwc : call sub32
+	pop	bc
+	ld	a,(v_tmp+3) : cp #10 : jp nc,.fnext			; за последним валидным кластером
+	; маркер bad cluster (0x?FFFFFF7) ?
+	ld	a,(ix+2) : cp #FF : jr nz,.notbad
+	ld	a,(ix+1) : cp #FF : jr nz,.notbad
+	ld	a,(ix+0) : cp #F7 : jp z,.fnext
+.notbad
+	; достижим ?
+	push	bc
+	ld	hl,v_bmc : ld de,v_fwc : call copy32
+	call	bm_test
+	pop	bc
+	jr	c,.fnext						; вне окна (не должно случаться)
+	jr	nz,.fnext						; достижим -> оставить
+	; ПОТЕРЯН -> освободить
+	xor	a : ld (ix+0),a : ld (ix+1),a : ld (ix+2),a : ld (ix+3),a
+	ld	a,1 : ld (fw_dirty),a
+	push	bc : ld hl,v_recovered : call inc32 : pop bc
+.fnext
+	push	bc : ld hl,v_fwc : call inc32 : pop bc
+	ld	de,4 : add ix,de
+	dec	b : jp nz,.fent
+	; записать обратно FAT0 + FAT1, если сектор менялся
+	ld	a,(fw_dirty) : or a : jr z,.nowr
+	di
+	ld	hl,(v_fwsec) : ld de,(v_fwsec+2)
+	ld	ix,sector_buf : call sd_write_sector			; FAT0
+	ld	hl,v_fw1 : ld de,v_fwsec : call copy32
+	ld	hl,v_fw1 : ld de,v_fatsz : call add32
+	ld	hl,(v_fw1) : ld de,(v_fw1+2)
+	ld	ix,sector_buf : call sd_write_sector			; FAT1
+	ei
+.nowr
+	ld	hl,v_fwsec  : call inc32
+	ld	hl,v_fwclus : ld de,c128 : call add32
+	ld	hl,(fw_seccnt) : dec hl : ld (fw_seccnt),hl
+	ld	a,h : or l : jp nz,.floop
+	ret
+
+;---------------------------------------------------------------
+; compose_tail - собрать две динамические нижние строки отчёта:
+;   строка «recovered»: "<N> lost allocation units recovered" только если что-то
+;     реально освобождено (v_recovered>0), иначе пусто;
+;   подсказка: "ENTER=repair ... ESC=exit" если chk_fixable, иначе только "ESC=exit".
+;---------------------------------------------------------------
+compose_tail:
+	ld	hl,txt_deepln  : ld (hl),' ' : ld de,txt_deepln+1  : ld bc,40 : ldir	; очистить все 3 строки
+	ld	hl,txt_recovln : ld (hl),' ' : ld de,txt_recovln+1 : ld bc,40 : ldir
+	ld	hl,txt_prompt  : ld (hl),' ' : ld de,txt_prompt+1  : ld bc,40 : ldir
+	; строка результата deep check (только если deep check уже запускался)
+	ld	a,(deep_done) : or a : jr z,.recov
+	ld	hl,s_xlbl    : ld de,txt_deepln    : ld bc,14 : ldir		; "Cross-linked: "
+	ld	hl,v_xlink   : ld de,txt_deepln+14 : ld b,6  : call fmt_dec32
+	ld	hl,s_slbl    : ld de,txt_deepln+20 : ld bc,12 : ldir		; "  Bad-size: "
+	ld	hl,v_sizemis : ld de,txt_deepln+32 : ld b,6  : call fmt_dec32
+.recov
+	ld	a,(repair_aborted) : or a : jr z,.norab
+	ld	hl,s_aborted : ld de,txt_recovln : ld bc,s_aborted_e-s_aborted : ldir	; «ремонт прерван»
+	jr	.prompt
+.norab
+	ld	a,(v_recovered) : ld hl,v_recovered+1 : or (hl) : inc hl : or (hl) : inc hl : or (hl)
+	jr	z,.prompt
+	ld	hl,v_recovered : ld de,txt_recovln : ld b,11 : call fmt_dec32
+	ld	hl,s_recovered : ld de,txt_recovln+11 : ld bc,s_recovered_e-s_recovered : ldir
+.prompt
+	; собрать подсказку из доступных в данный момент действий
+	ld	de,txt_prompt
+	call	chk_fixable : jr z,.pnofix
+	ld	hl,s_p_enter : ld bc,s_p_enter_e-s_p_enter : ldir	; "ENTER=repair " (lost/mirror/заголовок/bad-size/cross-link)
+.pnofix
+	ld	hl,s_p_space : ld bc,s_p_space_e-s_p_space : ldir	; "SPACE=deep "  (cross-link/bad-size)
+	ld	hl,s_p_esc   : ld bc,s_p_esc_e-s_p_esc     : ldir	; "ESC=exit"
+	ret
+
+;---------------------------------------------------------------
+; prog_redraw - перерисовать отчёт с живой строкой прогресса "<метка> NN% <бар>"
+;   (вызывается периодически из follow_chain/free_window). Сохраняет ВСЕ регистры,
+;   поэтому безопасен для вызова изнутри обхода цепочки.
+;---------------------------------------------------------------
+prog_redraw:
+	push	af : push bc : push de : push hl : push ix
+	ld	hl,txt_deepln : ld (hl),' ' : ld de,txt_deepln+1 : ld bc,40 : ldir
+	ld	hl,(prog_lbl) : ld de,txt_deepln    : ld bc,11 : ldir	; 11-символьная метка
+	ld	a,(prog_hasm) : or a : jr z,.justk
+	call	prog_pctbar				; "<проц>% <бар>" начиная с +11
+	jr	.draw
+.justk	ld	hl,v_dscan    : ld de,txt_deepln+11 : ld b,7  : call fmt_dec32	; запасной путь: сырой счётчик
+.draw
+	; во время оконного обхода страница bitmap живёт в #C000 -> подменить её экраном
+	; WC на время отрисовки, затем вернуть bitmap. Синхронизация зеркала FAT идёт с
+	; уже замапленным экраном (prog_swap=0) -> рисуем напрямую без подмены.
+	ld	a,(prog_swap) : or a : jr z,.nosw
+	ld	a,SCR_PAGE : call MNGC_PL		; экран -> #C000
+	call	draw_report
+	ld	a,BM_PAGE  : call MNGC_PL		; вернуть страницу bitmap -> #C000
+	jr	.rdone
+.nosw	call	draw_report
+.rdone	pop	ix : pop hl : pop de : pop bc : pop af
+	ret
+
+;---------------------------------------------------------------
+; prog_pctbar - вывести "<проц>% <бар>" в txt_deepln+11:
+;   +11..13 процент (ширина 3), +14 '%', +15 пробел, +16..+40 бар (BARW ячеек).
+;   percent = dscan / pctunit (<=100);  fill = dscan / barunit (<=BARW).
+;---------------------------------------------------------------
+BARW		equ	25			; ширина бара: заполняет txt_deepln (41) после 11-символьной метки и "NNN% "
+prog_pctbar:
+	ld	hl,num    : ld de,v_dscan   : call copy32
+	ld	hl,den32  : ld de,v_pctunit : call copy32
+	call	div32					; num = процент
+	ld	a,100 : call clamp_num			; ограничить сверху 100
+	ld	hl,num : ld de,txt_deepln+11 : ld b,3 : call fmt_dec32
+	ld	a,'%' : ld (txt_deepln+14),a
+	ld	hl,num    : ld de,v_dscan   : call copy32
+	ld	hl,den32  : ld de,v_barunit : call copy32
+	call	div32					; num = заполнение бара
+	ld	a,BARW : call clamp_num
+	ld	a,(num) : ld c,a			; C = число заполненных ячеек
+	ld	hl,txt_deepln+16 : ld b,BARW		; бар сразу после "NNN% " (без скобок)
+	; псевдографика скролл-бара WC: #DB = сплошной блок (заполнено), #B1 = затенённый трек (пусто)
+.cell	ld	a,c : or a : jr z,.empty
+	dec	c : ld (hl),#DB : jr .next
+.empty	ld	(hl),#B1
+.next	inc	hl : djnz .cell
+	ret
+
+;--- clamp_num: num = min(num, A)  (A = максимум, < 256)
+clamp_num:
+	ld	d,a					; D = максимум
+	ld	a,(num+1) : ld hl,num+2 : or (hl) : inc hl : or (hl)
+	jr	nz,.clip				; старшие байты ненулевые -> >255 >= max
+	ld	a,(num) : cp d : jr c,.ok : jr z,.ok	; num <= max
+.clip	ld	hl,num : ld (hl),d : inc hl : xor a : ld (hl),a : inc hl : ld (hl),a : inc hl : ld (hl),a
+.ok	ret
+
+;--- prog_units: из v_dtotal вычислить v_pctunit = max(1,dtotal/100) и
+;    v_barunit = max(1,dtotal/BARW).  Вызывается один раз, когда v_dtotal финализирован.
+prog_units:
+	ld	hl,num   : ld de,v_dtotal : call copy32
+	ld	hl,den32 : call zero32 : ld a,100  : ld (den32),a
+	call	div32
+	ld	hl,v_pctunit : ld de,num : call copy32
+	ld	hl,v_pctunit : call ensure_nonzero
+	ld	hl,num   : ld de,v_dtotal : call copy32
+	ld	hl,den32 : call zero32 : ld a,BARW : ld (den32),a
+	call	div32
+	ld	hl,v_barunit : ld de,num : call copy32
+	ld	hl,v_barunit : call ensure_nonzero
+	ret
+
+;--- ensure_nonzero: (HL) = max(1, (HL))  [4 байта LE] (защита от деления на 0)
+ensure_nonzero:
+	push	hl
+	ld	a,(hl) : inc hl : or (hl) : inc hl : or (hl) : inc hl : or (hl)
+	pop	hl
+	ret	nz
+	ld	(hl),1
+	ret
+
+;---------------------------------------------------------------
+; chk_fixable - вых: NZ, если по ENTER есть что чинить (потерянные кластеры,
+;   bad-size/cross-link после deep check, либо расхождение/битый заголовок FAT).
+;---------------------------------------------------------------
+chk_fixable:
+	ld	a,(v_lost) : ld hl,v_lost+1 : or (hl) : inc hl : or (hl) : inc hl : or (hl)
+	ret	nz
+	ld	a,(v_sizemis) : ld hl,v_sizemis+1 : or (hl) : inc hl : or (hl) : inc hl : or (hl)
+	jr	nz,.yes					; bad-size файлы (после deep check) -> чинимо
+	ld	a,(v_xlink) : ld hl,v_xlink+1 : or (hl) : inc hl : or (hl) : inc hl : or (hl)
+	jr	nz,.yes					; cross-link кластеры (после deep check) -> чинимо
+	ld	a,(mirror_on) : or a : ret z		; зеркалирование выкл -> расхождение FAT легально
+	ld	a,(first_ok) : ld hl,second_ok : and (hl) : jr z,.yes	; любой заголовок FAT битый -> чинимо
+	ld	a,(v_fatmis) : ld hl,v_fatmis+1 : or (hl) : inc hl : or (hl) : inc hl : or (hl)
+	ret
+.yes	ld	a,1 : or a : ret				; NZ -> чинимо
+
+;---------------------------------------------------------------
+; chk_space - вых: NZ, если удерживается SPACE (ряд клавиатуры ZX #7FFE, бит 0)
+;---------------------------------------------------------------
+chk_space:
+	ld	bc,#7FFE
+	in	a,(c)
+	and	1					; бит0 = SPACE (0 = нажат)
+	xor	1					; нажат -> 1 (NZ), отпущен -> 0 (Z)
+	ret
+
+;---------------------------------------------------------------
+; media_ok - вход: IX -> первый сектор FAT.  Вых: A=1, если заголовок FAT цел:
+;   FAT[0] = (0x?FFFFF00 | media-байт BPB): низший байт == v_media, байты 1-2 = 0xFF,
+;            младший ниббл байта 3 = 0xF;
+;   FAT[1] = EOC-маркер: низшие 28 бит все = 1 (байты 4-6 = 0xFF, ниббл байта 7 = 0xF).
+;   Точное сравнение с media-дескриптором BPB (v_media), поэтому F0/removable
+;   проходит, а повреждённый заголовок (любой иной низший байт или битый EOC) — нет.
+;---------------------------------------------------------------
+media_ok:
+	ld	a,(v_media) : cp (ix+0) : jr nz,.bad	; низший байт FAT[0] обязан равняться media-дескриптору BPB
+	ld	a,(ix+1) : cp #FF : jr nz,.bad
+	ld	a,(ix+2) : cp #FF : jr nz,.bad
+	ld	a,(ix+3) : and #0F : cp #0F : jr nz,.bad
+	ld	a,(ix+4) : cp #FF : jr nz,.bad		; EOC-маркер FAT[1]
+	ld	a,(ix+5) : cp #FF : jr nz,.bad
+	ld	a,(ix+6) : cp #FF : jr nz,.bad
+	ld	a,(ix+7) : and #0F : cp #0F : jr nz,.bad
+	ld	a,1 : ret
+.bad	xor	a : ret
+
+;---------------------------------------------------------------
+; check_fat_headers - прочитать сектора FAT0[0] и FAT1[0], проверить каждый
+;   заголовок (media_ok) -> first_ok / second_ok, и собрать строку отчёта txt_fathdr.
+;   Ловит повреждённый заголовок даже когда обе копии идентичны (mismatches=0) —
+;   это единственное место, где всплывает состояние «обе FAT битые».
+;---------------------------------------------------------------
+check_fat_headers:
+	di
+	ld	hl,(v_fatstart) : ld de,(v_fatstart+2) : ld ix,sector_buf : call sd_read_sector
+	ei
+	ld	ix,sector_buf : call media_ok : ld (first_ok),a
+	ld	hl,v_fat1sec : ld de,v_fatstart : call copy32
+	ld	hl,v_fat1sec : ld de,v_fatsz : call add32
+	di
+	ld	hl,(v_fat1sec) : ld de,(v_fat1sec+2) : ld ix,fat_buf : call sd_read_sector
+	ei
+	ld	ix,fat_buf : call media_ok : ld (second_ok),a
+	; --- собрать txt_fathdr по first_ok/second_ok ---
+	ld	hl,txt_fathdr : ld (hl),' ' : ld de,txt_fathdr+1 : ld bc,40 : ldir	; очистить
+	ld	a,(first_ok) : ld hl,second_ok : and (hl)
+	ret	nz					; оба заголовка валидны -> пустая строка
+	ld	a,(first_ok) : or a : jr z,.f0bad	; FAT0 битый?
+	; FAT0 ок, FAT1 битый
+	ld	hl,s_hdr_f1 : ld de,txt_fathdr : ld bc,s_hdr_f1_e-s_hdr_f1 : ldir
+	ret
+.f0bad	ld	a,(second_ok) : or a : jr z,.bothbad
+	; FAT0 битый, FAT1 ок
+	ld	hl,s_hdr_f0 : ld de,txt_fathdr : ld bc,s_hdr_f0_e-s_hdr_f0 : ldir
+	ret
+.bothbad
+	ld	hl,s_hdr_both : ld de,txt_fathdr : ld bc,s_hdr_both_e-s_hdr_both : ldir
+	ret
+
+s_hdr_f0	db	"FAT0 header BAD (will restore from FAT1)"
+s_hdr_f0_e
+s_hdr_f1	db	"FAT1 header BAD (will restore from FAT0)"
+s_hdr_f1_e
+s_hdr_both	db	"BOTH FAT headers BAD (rebuild from BPB)"
+s_hdr_both_e
+
+;---------------------------------------------------------------
+; fat_sectors_equal - вых: Z если sector_buf == fat_buf на протяжении 512 байт
+;---------------------------------------------------------------
+fat_sectors_equal:
+	push	bc : push de : push hl
+	ld	hl,sector_buf : ld de,fat_buf : ld bc,512
+.c	ld	a,(de) : cp (hl) : jr nz,.ne
+	inc	hl : inc de : dec bc : ld a,b : or c : jr nz,.c
+	pop	hl : pop de : pop bc : xor a : ret	; равны
+.ne	pop	hl : pop de : pop bc : or 1 : ret	; различаются
+
+;---------------------------------------------------------------
+; repair_fat_mirror - согласовать различающиеся копии FAT (dosfstools read_fat):
+;   first_ok = заголовок FAT0[0] цел, second_ok = заголовок FAT1[0] цел.
+;     first_ok && !second_ok  -> источник = FAT0
+;     !first_ok && second_ok  -> источник = FAT1 (FAT0 повреждена)
+;     иначе (обе ок / обе битые)-> источник = FAT0 (дефолт «брать первую»).
+;   Копирует каждый различающийся сектор источника поверх приёмника.
+;---------------------------------------------------------------
+;---------------------------------------------------------------
+; rebuild_fat0_header - реконструировать служебные записи FAT0 из BPB:
+;   FAT[0] = 0xFFFFFF00 | media-байт,  FAT[1] = 0xFFFFFFFF (EOC).
+;   Применяется, когда ОБА заголовка битые (копировать неоткуда). Читает сектор 0
+;   FAT0, чтобы сохранить записи данных (кластеры 2..127) в этом секторе.
+;---------------------------------------------------------------
+; set_fat_eoc - записать FAT[v_truncclus] = EOC (0x0FFFFFFF) в FAT0 и FAT1 через
+;   read-modify-write FAT-сектора в fat_buf; инвалидирует кэш цепочки.
+;   Используется ремонтом cross-link для обрезания цепочки. Регистры не сохраняет.
+set_fat_eoc:
+	ld	hl,v_tmp : ld de,v_truncclus : call copy32
+	ld	b,7
+.sh	ld	hl,v_tmp : call shr32_1 : djnz .sh		; v_tmp = truncclus >> 7 (индекс FAT-сектора)
+	ld	hl,v_tmp : ld de,v_fatstart : call add32		; сектор FAT0
+	di
+	ld	hl,(v_tmp) : ld de,(v_tmp+2) : ld ix,fat_buf : call sd_read_sector
+	ei
+	ld	a,(v_truncclus) : and 127 : ld l,a : ld h,0 : add hl,hl : add hl,hl	; (clus&127)*4
+	ld	de,fat_buf : add hl,de				; -> запись в fat_buf
+	ld	(hl),#FF : inc hl : ld (hl),#FF : inc hl : ld (hl),#FF : inc hl : ld (hl),#0F	; EOC
+	di
+	ld	hl,(v_tmp) : ld de,(v_tmp+2) : ld ix,fat_buf : call sd_write_sector	; FAT0
+	ei
+	ld	hl,v_tmp : ld de,v_fatsz : call add32
+	di
+	ld	hl,(v_tmp) : ld de,(v_tmp+2) : ld ix,fat_buf : call sd_write_sector	; FAT1
+	ei
+	ld	hl,v_fatcache : ld (hl),#FF : inc hl : ld (hl),#FF : inc hl : ld (hl),#FF : inc hl : ld (hl),#FF
+	ret
+
+rebuild_fat0_header:
+	di
+	ld	hl,(v_fatstart) : ld de,(v_fatstart+2) : ld ix,sector_buf : call sd_read_sector
+	ei
+	ld	a,(v_media) : ld (sector_buf+0),a			; media-дескриптор FAT[0]
+	ld	a,#FF
+	ld	(sector_buf+1),a : ld (sector_buf+2),a : ld (sector_buf+3),a	; старшие байты FAT[0]
+	ld	(sector_buf+4),a : ld (sector_buf+5),a : ld (sector_buf+6),a : ld (sector_buf+7),a	; EOC FAT[1]
+	di
+	ld	hl,(v_fatstart) : ld de,(v_fatstart+2) : ld ix,sector_buf : call sd_write_sector
+	ei
+	ret
+
+repair_fat_mirror:
+	di
+	ld	hl,(v_fatstart) : ld de,(v_fatstart+2) : ld ix,sector_buf : call sd_read_sector
+	ei
+	ld	ix,sector_buf : call media_ok : ld (first_ok),a
+	ld	hl,v_fm1 : ld de,v_fatstart : call copy32
+	ld	hl,v_fm1 : ld de,v_fatsz : call add32
+	di
+	ld	hl,(v_fm1) : ld de,(v_fm1+2) : ld ix,sector_buf : call sd_read_sector
+	ei
+	ld	ix,sector_buf : call media_ok : ld (second_ok),a
+	; обе копии заголовка битые? восстанавливать неоткуда -> реконструировать заголовок
+	; FAT0 из media-байта BPB + константы EOC; тогда FAT0 станет источником-эталоном ниже.
+	ld	a,(first_ok) : ld hl,second_ok : or (hl) : jr nz,.choose
+	call	rebuild_fat0_header
+	ld	a,1 : ld (first_ok),a
+.choose
+	; выбрать источник: по умолчанию первая; вторая — только если (!first_ok && second_ok)
+	xor	a : ld (fm_used_second),a
+	ld	a,(first_ok) : or a : jr nz,.src_set
+	ld	a,(second_ok) : or a : jr z,.src_set		; обе битые -> по умолчанию первая
+	ld	a,1 : ld (fm_used_second),a
+.src_set
+	ld	hl,fm_srcsec : ld de,v_fatstart : call copy32
+	ld	hl,fm_dstsec : ld de,v_fatstart : call copy32
+	ld	a,(fm_used_second) : or a : jr z,.dst_fat1
+	ld	hl,fm_srcsec : ld de,v_fatsz : call add32	; источник = FAT1
+	jr	.cnt
+.dst_fat1
+	ld	hl,fm_dstsec : ld de,v_fatsz : call add32	; приёмник = FAT1
+.cnt
+	ld	hl,v_fmcnt : ld de,v_fatsz : call copy32
+	; прогресс по всем FAT-секторам (экран уже в #C000 -> prog_swap=0)
+	ld	hl,s_syncfat : ld (prog_lbl),hl
+	ld	a,1 : ld (prog_hasm),a
+	xor	a : ld (prog_swap),a
+	ld	hl,v_dscan  : call zero32
+	ld	hl,v_dtotal : ld de,v_fatsz : call copy32
+	call	prog_units
+	call	prog_redraw				; 0%
+.cloop
+	ld	a,(v_fmcnt) : ld hl,v_fmcnt+1 : or (hl) : inc hl : or (hl) : inc hl : or (hl)
+	jr	z,.cdone
+	ld	hl,v_dscan : call inc32
+	ld	a,(v_dscan) : and 31 : call z,prog_redraw	; редрав каждые 32 сектора
+	di
+	ld	hl,(fm_srcsec) : ld de,(fm_srcsec+2) : ld ix,sector_buf : call sd_read_sector
+	ld	hl,(fm_dstsec) : ld de,(fm_dstsec+2) : ld ix,fat_buf    : call sd_read_sector
+	ei
+	call	fat_sectors_equal : jr z,.cnext		; секторы равны -> писать не нужно
+	di
+	ld	hl,(fm_dstsec) : ld de,(fm_dstsec+2) : ld ix,sector_buf : call sd_write_sector
+	ei
+.cnext
+	ld	hl,fm_srcsec : call inc32
+	ld	hl,fm_dstsec : call inc32
+	ld	hl,v_fmcnt   : call dec32
+	jp	.cloop
+.cdone	call	prog_redraw				; финальные 100%
+	ret
+
+; --- строковые литералы отчёта/подсказок (НЕ переводить: точная ширина и набор глифов WC) ---
+s_recovered	db	" allocation units recovered"		; «N единиц размещения восстановлено»
+s_recovered_e
+s_aborted	db	"Repair aborted - too many dirs"	; «ремонт прерван — слишком много каталогов»
+s_aborted_e
+s_xlbl		db	"Cross-linked: "			; метка «перекрёстных ссылок»
+s_slbl		db	"  Bad-size: "				; метка «несовпадение размера»
+s_checking	db	"Deep check:"		; ровно 11 знаков (метка прогресса deep check)
+s_checking_e
+s_repairing	db	"Repairing: "		; ровно 11 знаков (метка прогресса ремонта lost)
+s_syncfat	db	"Sync FAT:  "		; ровно 11 знаков (прогресс синхронизации зеркала FAT)
+s_fixsize	db	"Fix sizes: "		; ровно 11 знаков (прогресс ремонта bad-size)
+s_fixxl		db	"Fix x-link:"		; ровно 11 знаков (прогресс ремонта cross-link)
+s_slash		db	" / "
+s_p_enter	db	"ENTER=repair  "			; подсказка: чинить
+s_p_enter_e
+s_p_space	db	"SPACE=deep check  "			; подсказка: глубокая проверка
+s_p_space_e
+s_p_esc		db	"ESC=exit"				; подсказка: выход
+s_p_esc_e
+
+;---------------------------------------------------------------
+	INCLUDE "sd_zc.a80"		; драйвер SD (Z-Controller)
+	INCLUDE "fmt.a80"		; 32-битная арифметика + форматирование чисел
+	INCLUDE "bitmap.a80"		; оконный bitmap достижимости + обход FAT-цепочек
+
+;---------------------------------------------------------------
+; Данные (переменные плагина; все v_* — 32-битные LE, если не указано иное)
+;---------------------------------------------------------------
+part_lba	ds	4		; LBA начала раздела FAT32 (из MBR; 0 для superfloppy)
+v_fatsz		ds	4		; размер одной копии FAT в секторах (FATSz32)
+v_totsec	ds	4		; всего секторов на томе
+v_resv		ds	4		; зарезервированных секторов (до FAT)
+v_firstdata	ds	4		; первый сектор области данных
+v_datasec	ds	4		; число секторов области данных
+v_clussize	ds	4		; размер кластера в байтах
+v_totspace	ds	4		; всего байт данных на диске
+v_allocunits	ds	4		; всего кластеров (единиц размещения)
+v_fatstart	ds	4		; абсолютный сектор начала FAT0
+v_remain	ds	4		; осталось записей FAT просканировать
+v_free		ds	4		; свободных кластеров
+v_cursec	ds	4		; текущий сектор скана FAT
+v_bytesavail	ds	4		; свободно байт на диске
+v_fattot	ds	4		; всего FAT-секторов (для прогресса скана)
+v_scanned	ds	4		; просканировано FAT-секторов
+v_log2spc	db	0		; log2(секторов на кластер)
+c127		db	127,0,0,0	; константа 127 (для округления вверх /128)
+c2		db	2,0,0,0		; константа 2 (кластеры нумеруются с 2)
+v_rootclus	ds	4		; кластер корневого каталога
+v_spc		db	0		; секторов на кластер (SPC)
+v_filecnt	ds	4		; счётчик файлов
+v_filebytes	ds	4		; суммарный размер файлов в байтах
+v_dircnt	ds	4		; счётчик каталогов
+v_dirclus	ds	4		; счётчик кластеров каталогов
+v_dirbytes	ds	4		; байт в каталогах
+v_datastart	ds	4		; абсолютный сектор начала области данных
+v_curdir	ds	4		; кластер текущего обрабатываемого каталога
+v_curclus	ds	4		; текущий кластер при обходе цепочки каталога
+v_clussec	ds	4		; абсолютный сектор текущего кластера
+v_tmp		ds	4		; временная 32-битная (общая)
+v_tmp2		ds	4		; временная 32-битная (вторая)
+v_expused	ds	4		; ожидаемо занято кластеров (по размерам файлов + каталоги)
+v_allocated	ds	4		; занято кластеров = всего - свободно
+v_lost		ds	4		; потерянных кластеров (allocated - expused)
+v_csm1		ds	4		; clusterSize - 1 (для округления вверх)
+v_fatmis	ds	4		; различающихся секторов зеркала FAT (backup-FAT mismatches)
+v_fat1sec	ds	4		; абсолютный сектор соответствующего сектора FAT1
+; --- ремонт (освобождение lost + зеркало FAT) ---
+walk_mode	db	0		; режим dir_walk: 0 счёт / 1 пометка / 2 детект / 3 bad-size / 4 cross-link
+mirror_on	db	0			; 1 если зеркалирование FAT активно (ExtFlags бит7 сброшен, numFATs>=2)
+fat_base	ds	4			; абс. сектор FAT, которую читает обход цепочки (FAT0)
+; --- ремонт зеркала FAT (алгоритм dosfstools fsck.fat read_fat()) ---
+v_fm1		ds	4			; первый сектор FAT1 (проверка media-байта)
+v_fmcnt		ds	4			; осталось FAT-секторов скопировать
+fm_srcsec	ds	4			; копия зеркала: абс. сектор источника
+fm_dstsec	ds	4			; копия зеркала: абс. сектор приёмника
+first_ok	db	0			; заголовок FAT0 валиден? (media_ok: media-байт FAT[0] + EOC FAT[1])
+second_ok	db	0			; заголовок FAT1 валиден?
+v_media		db	0			; media-дескриптор BPB (sector_buf+21); низший байт FAT[0] обязан совпадать
+fm_used_second	db	0			; 1 если источником выбрана FAT1 (FAT0 была повреждена)
+; --- детект (cross-link + длина-vs-размер, dosfstools check.c) ---
+v_xlink		ds	4			; перекрёстно-связанных (дважды занятых) кластеров
+v_sizemis	ds	4			; файлов с длиной цепочки != ceil(размер/кластер)
+v_sizefixed	ds	4			; ремонт режима 3: файлов, чей размер выставлен по цепочке
+ds_dirty	db	0			; режимы 3/4: текущий сектор каталога правился -> сбросить на диск
+v_xlinkfixed	ds	4			; ремонт режима 4: обрезанных cross-link-цепочек
+v_prevclus	ds	4			; follow_chain режим 4: предыдущий кластер цепочки (точка обрезки)
+v_truncclus	ds	4			; кластер, чья запись FAT ставится в EOC процедурой set_fat_eoc
+v_xlfound	db	0			; режим 4: текущая цепочка наткнулась на cross-link-кластер
+v_xlempty	db	0			; режим 4: cross-link на первом кластере -> опустошить файл
+v_chainlen	ds	4			; follow_chain: пройдено кластеров в текущей цепочке
+v_explen	ds	4			; ожидаемая длина цепочки текущего файла
+detect_w0	db	0			; 1 в первом окне детекта (где делаются проверки размера)
+deep_done	db	0			; 0 = deep check ещё не запускался (ENTER запускает его), 1 = выполнен (ENTER чинит)
+repair_aborted	db	0			; 1 если repair_lost прервался (переполнение очереди -> потеря данных)
+v_dscan		ds	4			; прогресс: просканировано кластеров/секторов
+v_reach		ds	4			; достижимых кластеров = allocated - lost
+v_dtotal	ds	4			; знаменатель прогресса = достижимые * число окон
+v_pctunit	ds	4			; dtotal/100  -> процент  = dscan / v_pctunit
+v_barunit	ds	4			; dtotal/BARW -> заполнение бара = dscan / v_barunit
+prog_lbl	dw	0			; -> 11-символьная метка прогресса (s_checking/s_repairing/s_syncfat/...)
+prog_hasm	db	0			; 1 = показывать процент + бар, 0 = только сырой счётчик
+prog_swap	db	0			; 1 = страница bitmap в #C000 (обход) -> prog_redraw свопает экран; 0 = экран уже замаплен
+v_winlo		ds	4			; нижняя граница текущего окна кластеров
+v_rel		ds	4			; смещение кластера внутри окна (bm_addr)
+v_bmc		ds	4			; кластер для bm_set/bm_test/bm_addr
+v_markclus	ds	4			; текущий кластер при follow_chain
+v_fatcache	ds	4			; id закэшированного FAT-сектора (fat_next_cached)
+v_recovered	ds	4			; освобождено потерянных кластеров
+v_fwsec		ds	4			; free_window: текущий FAT-сектор
+v_fwclus	ds	4			; free_window: первый кластер текущего FAT-сектора
+v_fwc		ds	4			; free_window: текущий рассматриваемый кластер
+v_fw1		ds	4			; free_window: соответствующий сектор FAT1 (для записи)
+fw_seccnt	dw	0			; FAT-секторов на окно (до 1024 для 131072) — нужно 16 бит
+fw_dirty	db	0			; free_window: текущий FAT-сектор менялся -> записать
+c128		db	128,0,0,0		; константа 128 (записей FAT в секторе)
+c_window	db	WINDOW_CLUSTERS & 255, (WINDOW_CLUSTERS >> 8) & 255, (WINDOW_CLUSTERS >> 16) & 255, (WINDOW_CLUSTERS >> 24) & 255	; размер окна в кластерах (32-бит)
+c_freesec	db	(WINDOW_CLUSTERS/128) & 255, ((WINDOW_CLUSTERS/128) >> 8) & 255, 0, 0	; FAT-секторов скана на окно
+fat_buf		ds	512			; буфер сектора FAT (кэш цепочки / зеркало)
+cl_seccnt	db	0			; секторов в кластере осталось обработать (dir_walk)
+q_head		db	0			; голова кольцевой очереди BFS
+q_tail		db	0			; хвост кольцевой очереди BFS
+q_overflow	db	0			; ставится при переполнении очереди -> ремонт НЕ должен освобождать
+queue_buf	ds	MAXDIRS*4		; кольцевой буфер очереди BFS
+sector_buf	ds	512			; основной буфер сектора (BPB / каталог / FAT)
+
+;---------------------------------------------------------------
+; Окно отчёта (только рамка; содержимое рисуется через TXTPR -> txt_wnd)
+;---------------------------------------------------------------
+wc_win
+	db	#81			; бит7=тень + стиль рамки 1 (младший ниббл 0..2; #84=стиль4 ломал рамку)
+	db	0
+	db	16,4			; x_pos, y_pos (опущено на 2 текстовые строки)
+	db	46,23			; x_size, y_size
+	db	_blue << 4 | _bright_white
+	db	0
+	dw	0
+	db	0
+	db	0
+	dw	txt_hdr
+	dw	0
+	dw	0			; wnd_txt пуст -> содержимое через TXTPR
+txt_hdr	db	#0E, 9, " ChkDsk FAT32 ", 0
+
+; Показывается ПОКА сканируется FAT (чтобы ещё не вычисленные поля отчёта не
+; мелькали пустыми). Заменяется на txt_wnd по завершении.
+txt_scanning db	#0E, "Checking disk", #0D, #0D, #0D
+	db	#0E, "Reading allocation table", #0D, #0D, #0D
+	db	#0E, "sector "
+txt_scan_n2 db	"     "
+	db	" of "
+txt_scan_t2 db	"     "
+	db	#0D, #0D, #0D, #0D
+	db	#0E, "please wait . . .", 0
+
+; Заголовок центрирован (#0E); строки данных слева на колонке TXTPR (без #0E),
+; чтобы 11-символьные числа с выравниванием вправо стояли в столбик.
+txt_wnd	db	#0E, "Volume report", #0D, #0D
+	db	" "
+txt_space  db	"           "		; поле 11 знаков
+	db	" bytes total disk space", #0D
+	db	" "
+txt_dirbytes db	"           "
+	db	" bytes in "
+txt_dircnt db	"     "			; поле 5 знаков
+	db	" directories", #0D
+	db	" "
+txt_filebytes db "           "
+	db	" bytes in "
+txt_filecnt db	"     "
+	db	" user files", #0D
+	db	" "
+txt_avail  db	"           "
+	db	" bytes available on disk", #0D, #0D
+	db	" "
+txt_unit   db	"           "
+	db	" bytes in each allocation unit", #0D
+	db	" "
+txt_units  db	"           "
+	db	" total allocation units", #0D
+	db	" "
+txt_aunits db	"           "
+	db	" available allocation units", #0D, #0D
+	db	" "
+txt_lost   db	"           "
+	db	" lost allocation units", #0D
+	db	" "
+txt_fatmis db	"           "
+	db	" backup-FAT mismatches", #0D
+	db	" "
+txt_fathdr  ds	41, ' '			; в рантайме: предупреждение о валидности заголовка FAT (пусто, если обе ок)
+	db	#0D, #0D
+	db	" "
+txt_deepln  ds	41, ' '			; строка прогресса "<метка> NN% <бар>", потом "Cross-linked: N  Bad-size: M" (<= ширины окна)
+	db	#0D
+	db	" "
+txt_recovln ds	41, ' '			; собирается в рантайме: "<N> allocation units recovered" или пусто
+	db	#0D, #0D
+	db	" "
+txt_prompt  ds	41, ' '			; собирается: "ENTER=repair SPACE=deep ESC=exit" (только активные действия)
+	db	0
+
+wc_err					; окно ошибки (красное)
+	db	#81+3
+	db	0
+	db	22,11
+	db	36,5
+	db	_red << 4 | _bright_white
+	db	0
+	dw	0
+	db	0
+	db	0
+	dw	txt_ehdr
+	dw	0
+	dw	0			; wnd_txt патчится в рантайме (+16) под нужный текст ошибки
+txt_ehdr db	#0E, 9, " ChkDsk - error ", 0
+txt_e_read  db	#0D, #0E, "SD read error", 0
+txt_e_nofat db	#0D, #0E, "Not a FAT32 volume", 0

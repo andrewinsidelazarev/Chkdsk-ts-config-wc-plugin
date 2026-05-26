@@ -1,0 +1,185 @@
+;//////////////////////////////////////////////////////////////
+;//  bitmap.a80 — оконный bitmap «достижимых кластеров» + обход FAT-цепочек.
+;//
+;//  Bitmap отмечает, какие кластеры заняты живыми файлами/каталогами. Полный
+;//  bitmap на весь том велик (на 201566 кластеров ~25 КБ), а адресное окно — 16 КБ,
+;//  поэтому работаем ОКНАМИ: bitmap покрывает кластеры [v_winlo, v_winlo+WINDOW_CLUSTERS),
+;//  и ремонт/детект гоняют дерево заново для каждого окна (учебник §5.1).
+;//  Релиз: WINDOW_CLUSTERS=131072 -> bitmap ровно 16 КБ -> wc.img (201566 кл.) за 2 окна.
+;//  Тест-харнесс передаёт -DWINDOW_CLUSTERS=256, чтобы прогнать многооконность на test.img.
+;//////////////////////////////////////////////////////////////
+
+	IFNDEF WINDOW_CLUSTERS
+WINDOW_CLUSTERS	equ	131072		; релиз: 16-КБ bitmap на странице #C000 -> wc.img за 2 окна
+	ENDIF				; харнесс передаёт -DWINDOW_CLUSTERS=256 для проверки многооконности
+BM_BYTES	equ	WINDOW_CLUSTERS / 8	; 131072/8 = 16384 = ровно одна 16-КБ страница TS-Conf
+bm_buf		equ	#C000		; bitmap достижимых кластеров живёт в окне #C000
+					; (рабочая страница плагина с индексом BM_PAGE, подключается через MNGC_PL);
+					; НЕ входит в образ кода #8000, очищается в рантайме через bm_clear.
+BM_PAGE		equ	1		; индекс страницы плагина для рабочей страницы (совпадает с числом страниц в +36)
+SCR_PAGE	equ	#FE		; аргумент MNGC_PL, возвращающий текстовый экран WC в окно #C000
+
+;--- bm_clear: обнулить весь bitmap текущего окна (16 КБ по #C000)
+bm_clear:
+	ld	hl,bm_buf
+	ld	de,bm_buf + 1
+	ld	bc,BM_BYTES - 1
+	ld	(hl),0
+	ldir
+	ret
+
+;--- bm_addr: вход — номер кластера в v_bmc. Выход: CF=1 если кластер ВНЕ окна;
+;    иначе CF=0, HL=&байт в bm_buf, C=битовая маска (1 << (rel & 7)).
+bm_addr:
+	ld	hl,v_rel : ld de,v_bmc   : call copy32
+	ld	hl,v_rel : ld de,v_winlo : call sub32	; rel = кластер - winlo (смещение внутри окна)
+	ld	a,(v_rel+3) : or a : scf : ret nz	; биты 24+ выставлены (огромное/отрицательное) -> вне окна
+	; byteidx = rel >> 3.  rel теперь может быть до 17 бит (WINDOW_CLUSTERS=131072),
+	; поэтому сдвигаем вправо на 3 младшие 24 бита C:H:L, а не только HL.
+	ld	a,(v_rel+2) : ld c,a			; биты 16-23
+	ld	a,(v_rel+1) : ld h,a			; биты 8-15
+	ld	a,(v_rel+0) : ld l,a			; биты 0-7
+	srl	c : rr h : rr l
+	srl	c : rr h : rr l
+	srl	c : rr h : rr l				; CHL = rel >> 3
+	ld	a,c : or a : scf : ret nz		; byteidx >= 65536 -> вне окна
+	ld	de,BM_BYTES
+	push	hl : or a : sbc hl,de : pop hl		; byteidx - BM_BYTES
+	jr	c,.inwin				; byteidx < BM_BYTES -> внутри окна
+	scf : ret					; вне окна
+.inwin
+	ld	de,bm_buf : add hl,de			; &байт (#C000..#FFFF)
+	ld	a,(v_rel) : and 7 : ld b,a		; маска = 1 << (rel & 7)
+	ld	a,1
+	inc	b
+.sh	dec	b : jr z,.done
+	add	a,a : jr .sh
+.done	ld	c,a
+	or	a					; CF=0 (внутри окна)
+	ret
+
+;--- bm_set: установить бит для кластера v_bmc (no-op, если вне окна)
+bm_set:
+	call	bm_addr
+	ret	c
+	ld	a,(hl) : or c : ld (hl),a
+	ret
+
+;--- bm_test: вых: NZ если бит достижимости установлен, Z если сброшен/вне окна
+bm_test:
+	call	bm_addr
+	ret	c					; вне окна -> Z (считаем «не установлен»)
+	ld	a,(hl) : and c
+	ret
+
+;--- fat_next_cached: v_markclus = FAT[v_markclus], через буфер fat_buf с
+;    одно-секторным кэшем (v_fatcache). Вых: CF=1 если EOC/невалидно (конец цепочки).
+fat_next_cached:
+	; нужный FAT-сектор = fatstart + (markclus >> 7)
+	ld	hl,v_tmp : ld de,v_markclus : call copy32
+	ld	b,7
+.sh	ld	hl,v_tmp : call shr32_1 : djnz .sh
+	ld	hl,v_tmp : ld de,fat_base : call add32		; база активной FAT (FAT0/FAT1)
+	; тот же сектор, что в кэше?
+	ld	hl,v_tmp : ld de,v_fatcache : call cmp4
+	jr	z,.have
+	ld	hl,v_fatcache : ld de,v_tmp : call copy32	; id кэша = нужный сектор
+	di
+	ld	hl,(v_tmp) : ld de,(v_tmp+2)
+	ld	ix,fat_buf
+	call	sd_read_sector
+	ei
+.have
+	ld	a,(v_markclus) : and 127			; смещение записи = (markclus & 127) * 4
+	ld	l,a : ld h,0 : add hl,hl : add hl,hl
+	ld	de,fat_buf : add hl,de
+	ld	de,v_markclus : ld bc,4 : ldir
+	ld	a,(v_markclus+3) : and #0F : ld (v_markclus+3),a	; FAT32: значащие только младшие 28 бит
+	; EOC / невалидно?
+	ld	a,(v_markclus+3) : cp #0F : jr nz,.nE
+	ld	a,(v_markclus+2) : cp #FF : jr nz,.nE
+	ld	a,(v_markclus+1) : cp #FF : jr nz,.nE
+	ld	a,(v_markclus+0) : cp #F8 : jr c,.nE
+	scf : ret					; >= 0x?FFFFFF8 -> EOC (конец цепочки)
+.nE	ld	a,(v_markclus+1) : or a : jr nz,.ok
+	ld	a,(v_markclus+2) : or a : jr nz,.ok
+	ld	a,(v_markclus+3) : or a : jr nz,.ok
+	ld	a,(v_markclus+0) : cp 2 : jr nc,.ok
+	scf : ret					; кластер < 2 -> невалидно (стоп)
+.ok	or a : ret
+
+;--- bm_mark_xlink: как bm_set, но если бит был УЖЕ установлен — кластер занят
+;    второй цепочкой -> перекрёстная ссылка/петля: v_xlink++ (детект, режим 2).
+bm_mark_xlink:
+	call	bm_addr
+	ret	c					; вне окна -> учитывается в своём окне
+	ld	a,(hl) : and c : jr z,.set
+	push	hl : ld hl,v_xlink : call inc32 : pop hl	; уже занят -> cross-link
+	ret
+.set	ld	a,(hl) : or c : ld (hl),a
+	ret
+
+;--- follow_chain: пройти цепочку кластеров от v_markclus, считая длину в v_chainlen.
+;    walk_mode 1 -> bm_set каждого кластера (карта достижимости);
+;    walk_mode 2 -> bm_mark_xlink (детект двойного claim'а);
+;    walk_mode 3 -> только счёт длины, без bitmap (ремонт bad-size);
+;    walk_mode 4 -> ремонт cross-link (см. блок .xl4 ниже).
+;    Защита от петли: цепочка длиннее totalClusters считается зацикленной -> выход.
+follow_chain:
+	ld	hl,v_chainlen : call zero32
+	xor	a : ld (v_xlfound),a : ld (v_xlempty),a	; выходные флаги режима 4
+	ld	a,(v_markclus+1) : or a : jr nz,.go
+	ld	a,(v_markclus+2) : or a : jr nz,.go
+	ld	a,(v_markclus+3) : or a : jr nz,.go
+	ld	a,(v_markclus+0) : cp 2 : ret c		; кластер < 2 -> пустая цепочка
+.go	ld	a,(walk_mode) : cp 4 : jp z,.xl4	; режим 4: ремонт cross-link (обрезать 2-го)
+	cp	3 : jr z,.cnt				; режим 3: только счёт длины, без bitmap (ремонт размера)
+	ld	hl,v_bmc : ld de,v_markclus : call copy32
+	ld	a,(walk_mode) : cp 2 : jr z,.det
+	call	bm_set					; режим 1: пометить достижимым
+	jr	.cnt
+.det	call	bm_mark_xlink				; режим 2: детект двойного claim'а
+.cnt	ld	hl,v_chainlen : call inc32
+	; живой прогресс (ремонт=режим1, deep check=режим2): редрав каждые 256 кластеров
+	ld	a,(walk_mode) : or a : jr z,.nopg
+	ld	hl,v_dscan : call inc32
+	ld	a,(v_dscan) : or a : call z,prog_redraw
+.nopg
+	; защита от петли: chainlen > totalClusters -> цепочка зациклена, выход
+	ld	hl,v_tmp2 : ld de,v_allocunits : call copy32
+	ld	hl,v_tmp2 : ld de,v_chainlen : call sub32
+	ld	a,(v_tmp2+3) : cp #10 : ret nc		; chainlen > totalClusters -> выход
+	call	fat_next_cached
+	jr	nc,.go
+	ret
+
+;--- режим 4: ремонт cross-link. Каждый кластер в окне «присваивается» (bm_set).
+;    Если кластер уже занят более ранней цепочкой — обрезаем ТЕКУЩУЮ цепочку:
+;    FAT[prevclus]=EOC (или флаг «пусто», если это её первый кластер) и стоп.
+;    Владелец (тот, кто прошёл первым) сохраняет данные; второй теряет хвост.
+.xl4	ld	hl,v_bmc : ld de,v_markclus : call copy32
+	call	bm_test					; CF=1 вне окна; NZ=уже занят
+	jr	c,.xl4own				; вне окна -> присвоить/продолжить (обработается в своём окне)
+	jr	nz,.xl4hit				; занят более ранней цепочкой -> cross-link
+.xl4own	call	bm_set					; присвоить (no-op, если вне окна)
+	ld	hl,v_prevclus : ld de,v_markclus : call copy32	; prevclus = текущий кластер
+	jr	.cnt					; chainlen++, прогресс, защита, fat_next, повторная диспетчеризация
+.xl4hit	ld	a,(v_chainlen) : ld hl,v_chainlen+1 : or (hl) : inc hl : or (hl) : inc hl : or (hl)
+	ld	a,1 : ld (v_xlfound),a
+	jr	nz,.xl4tr				; chainlen>0 -> есть предыдущий кластер для обрезки
+	ld	(v_xlempty),a				; общий кластер — первый -> вызывающий опустошит файл
+	ret
+.xl4tr	ld	hl,v_truncclus : ld de,v_prevclus : call copy32
+	call	set_fat_eoc				; FAT[prevclus] = EOC в обеих копиях FAT
+	ret
+
+;--- cmp4: вых: Z если (HL)==(DE) на протяжении 4 байт
+cmp4:
+	push	hl : push de : push bc
+	ld	b,4
+.l	ld	a,(de) : cp (hl) : jr nz,.ne
+	inc	hl : inc de : djnz .l
+	pop	bc : pop de : pop hl
+	xor	a : ret					; Z (равны)
+.ne	pop	bc : pop de : pop hl
+	or	1 : ret					; NZ (различаются)

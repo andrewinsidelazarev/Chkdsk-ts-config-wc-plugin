@@ -1,0 +1,204 @@
+;//////////////////////////////////////////////////////////////
+;//  fmt.a80 — 32-битная арифметика (little-endian) и форматирование десятичных
+;//  чисел. Все величины — 4 байта LE в памяти (младший байт по меньшему адресу).
+;//  Используются повсюду в ChkDsk: счётчики секторов/кластеров, размеры, проценты.
+;////////////////////////////////////////////////////////////////
+
+;--- zero32: обнулить 32-битную величину по адресу HL: (HL) = 0
+zero32:
+	push	hl
+	xor	a
+	ld	(hl),a : inc hl
+	ld	(hl),a : inc hl
+	ld	(hl),a : inc hl
+	ld	(hl),a
+	pop	hl
+	ret
+
+;--- copy32: скопировать 32 бита (HL) = (DE)   [приёмник = HL, источник = DE]
+copy32:
+	push	hl : push de
+	ex	de,hl			; HL=источник, DE=приёмник (для LDIR)
+	ld	bc,4
+	ldir
+	pop	de : pop hl
+	ret
+
+;--- add32: (HL) += (DE)   (сохраняет BC — вызывающие крутят циклы по B через djnz)
+add32:
+	push	bc : push hl : push de
+	or	a			; сбросить перенос (CF=0)
+	ld	b,4
+.l	ld	a,(de)
+	adc	a,(hl)
+	ld	(hl),a
+	inc	hl : inc de
+	djnz	.l
+	pop	de : pop hl : pop bc
+	ret
+
+;--- sub32: (HL) -= (DE)   (нет инструкции sbc a,(de); используем C как временный; сохраняет BC)
+sub32:
+	push	bc : push hl : push de
+	or	a			; сбросить заём (borrow)
+	ld	b,4
+.l	ld	a,(de)
+	ld	c,a			; C = байт источника
+	ld	a,(hl)			; A = байт приёмника
+	sbc	a,c
+	ld	(hl),a
+	inc	hl : inc de
+	djnz	.l
+	pop	de : pop hl : pop bc
+	ret
+
+;--- inc32: (HL) += 1   (не портит регистр B — перенос вручную по байтам)
+inc32:
+	push	hl
+	inc	(hl) : jr nz,.done
+	inc	hl : inc (hl) : jr nz,.done
+	inc	hl : inc (hl) : jr nz,.done
+	inc	hl : inc (hl)
+.done	pop	hl
+	ret
+
+;--- dec32: (HL) -= 1   (заём только когда байт был 0; не портит B)
+dec32:
+	push	hl
+	ld	a,(hl) : dec (hl) : or a : jr nz,.done
+	inc	hl : ld a,(hl) : dec (hl) : or a : jr nz,.done
+	inc	hl : ld a,(hl) : dec (hl) : or a : jr nz,.done
+	inc	hl : dec (hl)
+.done	pop	hl
+	ret
+
+;--- shl32_1: (HL) <<= 1   (сдвиг влево на 1 бит, от младшего байта к старшему)
+shl32_1:
+	push	hl
+	or	a			; сбросить перенос
+	rl	(hl) : inc hl
+	rl	(hl) : inc hl
+	rl	(hl) : inc hl
+	rl	(hl)
+	pop	hl
+	ret
+
+;--- shr32_1: (HL) >>= 1   (сдвиг вправо на 1 бит, начиная со старшего байта)
+shr32_1:
+	push	hl
+	inc	hl : inc hl : inc hl	; перейти к старшему байту (MSB)
+	or	a			; сбросить перенос
+	rr	(hl) : dec hl
+	rr	(hl) : dec hl
+	rr	(hl) : dec hl
+	rr	(hl)
+	pop	hl
+	ret
+
+;--- div32_10: num /= 10 (на месте), остаток -> A. Восстанавливающее деление.
+;    Применяется для перевода числа в десятичную строку (по одной цифре, см. fmt_dec32).
+div32_10:
+	ld	c,0			; C = остаток
+	ld	b,32
+.lp
+	or	a			; сбросить перенос
+	ld	hl,num
+	rl	(hl) : inc hl		; num <<= 1; CF = бит, выехавший из старшего разряда
+	rl	(hl) : inc hl
+	rl	(hl) : inc hl
+	rl	(hl)
+	ld	a,c
+	rla				; A = (остаток<<1) | CF
+	ld	c,a
+	cp	10
+	jr	c,.skip
+	sub	10
+	ld	c,a
+	ld	hl,num
+	set	0,(hl)			; бит частного — в освободившийся младший разряд
+.skip
+	djnz	.lp
+	ld	a,c
+	ret
+
+;--- div32: num /= den32 (беззнаковое 32:32), остаток -> rem32.
+;    Восстанавливающее деление, 32 итерации. Вызывающий гарантирует den32 != 0.
+;    Используется для процентов и заполнения прогресс-бара (см. chkdsk.a80 prog_pctbar).
+div32:
+	push	bc : push hl : push de
+	ld	hl,rem32 : call zero32
+	ld	b,32
+.lp
+	or	a			; сбросить перенос
+	ld	hl,num
+	rl	(hl) : inc hl		; num <<= 1; CF = бит, выехавший из старшего разряда
+	rl	(hl) : inc hl
+	rl	(hl) : inc hl
+	rl	(hl)
+	ld	hl,rem32		; rem = (rem<<1) | CF
+	rl	(hl) : inc hl
+	rl	(hl) : inc hl
+	rl	(hl) : inc hl
+	rl	(hl)
+	call	cmp32_rd		; CF=1 если rem < den
+	jr	c,.skip
+	ld	hl,rem32 : ld de,den32 : call sub32
+	ld	hl,num : set 0,(hl)	; бит частного — в освободившийся младший разряд
+.skip
+	djnz	.lp
+	pop	de : pop hl : pop bc
+	ret
+
+;--- cmp32_rd: вых: CF=1 если rem32 < den32, CF=0 если rem32 >= den32 (беззнаково)
+;    Сравнение от старшего байта к младшему (для шага деления в div32).
+cmp32_rd:
+	push	hl : push de : push bc
+	ld	hl,rem32+3 : ld de,den32+3 : ld b,4
+.c	ld	a,(de) : ld c,a : ld a,(hl) : cp c : jr nz,.ne
+	dec	hl : dec de : djnz .c
+	pop	bc : pop de : pop hl
+	or	a			; все байты равны -> rem>=den -> CF=0
+	ret
+.ne	pop	bc : pop de : pop hl
+	ret				; CF берётся из cp (байт rem < байта den -> CF=1)
+
+;--- fmt_dec32: отформатировать 32-битное число как десятичное с выравниванием вправо.
+;    вход: HL -> источник (4 байта LE), DE -> поле вывода, B = ширина поля
+;    поле дополняется пробелами слева; число должно умещаться в B цифр.
+fmt_dec32:
+	push	de : push bc
+	ld	de,num			; num <- источник
+	ld	bc,4
+	ldir
+	pop	bc			; B = ширина
+	pop	de			; DE = поле
+	push	de : push bc		; заполнить поле пробелами
+.fill	ld	a,' '
+	ld	(de),a
+	inc	de
+	djnz	.fill
+	pop	bc : pop de
+	ld	l,e : ld h,d		; HL = поле
+	ld	c,b : ld b,0
+	add	hl,bc
+	dec	hl			; HL = крайний правый символ
+.dg
+	push	hl
+	call	div32_10		; A = очередная цифра (с младшей)
+	pop	hl
+	add	a,'0'
+	ld	(hl),a
+	dec	hl
+	push	hl			; num == 0 ?
+	ld	hl,num
+	ld	a,(hl) : inc hl
+	or	(hl) : inc hl
+	or	(hl) : inc hl
+	or	(hl)
+	pop	hl
+	jr	nz,.dg
+	ret
+
+num		ds	4		; рабочая область деления (делимое / частное)
+den32		ds	4		; делитель для div32
+rem32		ds	4		; остаток для div32
