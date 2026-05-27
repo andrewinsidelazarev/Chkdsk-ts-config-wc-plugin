@@ -31,6 +31,7 @@ SD-карту через хардварный SPI-контроллер (Z-Contro
 
          17 lost allocation units
           0 backup-FAT mismatches
+          0 orphaned LFN entries
 ```
 
 ## Что умеет (детект и ремонт)
