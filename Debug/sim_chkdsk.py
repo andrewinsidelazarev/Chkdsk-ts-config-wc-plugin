@@ -51,7 +51,7 @@ def expected_free(img: Path):
         fat = f.read(fatsz * 512)
     free = sum(1 for c in range(2, total + 2)
                if (struct.unpack_from("<I", fat, c * 4)[0] & 0x0FFFFFFF) == 0)
-    return free, free * spc * 512
+    return free, free * spc // 2          # available КБ = free*spc*512/1024 = free*spc/2
 
 
 def expected_lost(img: Path):
@@ -118,7 +118,8 @@ def reachable_set(img: Path):
 
 
 def expected_walk(img: Path):
-    """Live dir-tree ground truth: (files, filebytes, dirs, dirbytes)."""
+    """Live dir-tree ground truth: (files, fileKB, dirs, dirKB).
+    Размеры в КБ, как их теперь выводит плагин (filebytes>>10; dirclus*spc/2)."""
     import importlib.util as iu
     sp = iu.spec_from_file_location("inj", HERE.parent / "inject_chkdsk_to_wc_img.py")
     inj = iu.module_from_spec(sp); sp.loader.exec_module(inj)
@@ -141,7 +142,7 @@ def expected_walk(img: Path):
                 dirs += 1; q.append(e["cluster"])
             else:
                 files += 1; filebytes += e["size"]
-    return files, filebytes, dirs, dirclus * fi.spc * 512
+    return files, filebytes // 1024, dirs, dirclus * fi.spc // 2   # КБ: filebytes>>10; dirclus*spc/2
 
 
 class Sim:
@@ -297,7 +298,7 @@ def main():
         free = sim.u32(sym["v_free"])
         avail = sim.u32(sym["v_bytesavail"])
         exp_free, exp_avail = expected_free(IMG)   # computed live (injects change it)
-        print(f"  v_free={free} (expect {exp_free})   v_bytesavail={avail} (expect {exp_avail})")
+        print(f"  v_free={free} (expect {exp_free})   v_bytesavail(KB)={avail} (expect {exp_avail})")
         if (free, avail) != (exp_free, exp_avail):
             ok = False
             print("  FAIL: FAT free-scan mismatch")
@@ -307,8 +308,8 @@ def main():
         fc = sim.u32(sym["v_filecnt"]); fb = sim.u32(sym["v_filebytes"])
         dc = sim.u32(sym["v_dircnt"]); db_ = sim.u32(sym["v_dirbytes"])
         ef, efb, ed, edb = expected_walk(IMG)
-        print(f"  files={fc} (exp {ef})  filebytes={fb} (exp {efb})")
-        print(f"  dirs={dc} (exp {ed})  dirbytes={db_} (exp {edb})")
+        print(f"  files={fc} (exp {ef})  fileKB={fb} (exp {efb})")
+        print(f"  dirs={dc} (exp {ed})  dirKB={db_} (exp {edb})")
         if (fc, fb, dc, db_) != (ef, efb, ed, edb):
             ok = False
             print("  FAIL: dir-walk mismatch")

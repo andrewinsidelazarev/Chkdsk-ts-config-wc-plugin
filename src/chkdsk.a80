@@ -93,10 +93,9 @@ PLUGIN:
 	ld	b,9
 .csl	ld	hl,v_clussize : call shl32_1 : djnz .csl		; *512
 
-	; --- totalDiskSpace = dataSectors << 9 (всего байт данных) ---
+	; --- totalDiskSpaceKB = dataSectors >> 1 (КБ: dataSectors*512/1024; без переполнения на дисках >4ГБ) ---
 	ld	hl,v_totspace : ld de,v_datasec : call copy32
-	ld	b,9
-.tsl	ld	hl,v_totspace : call shl32_1 : djnz .tsl
+	ld	hl,v_totspace : call shr32_1
 
 	; --- totalAllocUnits = dataSectors >> log2(secPerClus) (всего кластеров) ---
 	ld	hl,v_allocunits : ld de,v_datasec : call copy32
@@ -173,10 +172,12 @@ PLUGIN:
 	ld	hl,v_cursec : call inc32
 	jp	.fat_sec
 .fat_done
-	; bytesAvailable = freeClusters << (9 + log2 secPerClus)  (свободно байт)
+	; bytesAvailableKB = (freeClusters << log2spc) >> 1  (КБ: free*secPerClus*512/1024; без переполнения)
 	ld	hl,v_bytesavail : ld de,v_free : call copy32
-	ld	a,(v_log2spc) : add a,9 : ld b,a
+	ld	a,(v_log2spc) : or a : jr z,.balr		; log2spc==0 (кластер=1 сектор) -> только >>1
+	ld	b,a
 .bal	ld	hl,v_bytesavail : call shl32_1 : djnz .bal
+.balr	ld	hl,v_bytesavail : call shr32_1
 
 	; === обход дерева каталогов (режим подсчёта) ===
 	ld	hl,v_datastart : ld de,part_lba    : call copy32	; dataStart = начало раздела + firstData
@@ -184,10 +185,12 @@ PLUGIN:
 	xor	a : ld (walk_mode),a				; 0 = только счёт (без пометки в bitmap)
 	call	dir_walk
 .walk_done
-	; dirBytes = dirClusters << (9 + log2 secPerClus)  (байт в каталогах)
+	; dirBytesKB = (dirClusters << log2spc) >> 1  (КБ в каталогах; без переполнения)
 	ld	hl,v_dirbytes : ld de,v_dirclus : call copy32
-	ld	a,(v_log2spc) : add a,9 : ld b,a
+	ld	a,(v_log2spc) : or a : jr z,.dblr		; log2spc==0 -> только >>1
+	ld	b,a
 .dbl	ld	hl,v_dirbytes : call shl32_1 : djnz .dbl
+.dblr	ld	hl,v_dirbytes : call shr32_1
 
 	; --- потерянные кластеры = allocated - expected-used (размерный метод) ---
 	ld	hl,v_expused   : ld de,v_dirclus    : call add32	; + кластеры каталогов
@@ -202,6 +205,9 @@ PLUGIN:
 	; --- занести остальные числа и перерисовать отчёт ---
 	ld	hl,v_dirbytes   : ld de,txt_dirbytes  : ld b,11 : call fmt_dec32
 	ld	hl,v_dircnt     : ld de,txt_dircnt    : ld b,5  : call fmt_dec32
+	; v_filebytes накоплен в байтах -> перевести в КБ (>>10) перед выводом
+	ld	b,10
+.fbkb	ld	hl,v_filebytes : call shr32_1 : djnz .fbkb
 	ld	hl,v_filebytes  : ld de,txt_filebytes : ld b,11 : call fmt_dec32
 	ld	hl,v_filecnt    : ld de,txt_filecnt   : ld b,5  : call fmt_dec32
 	ld	hl,v_bytesavail : ld de,txt_avail     : ld b,11 : call fmt_dec32
@@ -249,11 +255,13 @@ PLUGIN:
 	call	repair_lost				; обнуляет осиротевшие записи в FAT0 + FAT1
 	ld	a,(repair_aborted) : or a : jr nz,.skiplost	; прерван (переполнение очереди) -> ничего не освобождено
 	ld	hl,v_lost : call zero32
-	; свободные units += освобождённые;  bytesAvailable = free << (9 + log2 spc)
+	; свободные units += освобождённые;  bytesAvailableKB = (free << log2spc) >> 1
 	ld	hl,v_free : ld de,v_recovered : call add32
 	ld	hl,v_bytesavail : ld de,v_free : call copy32
-	ld	a,(v_log2spc) : add a,9 : ld b,a
+	ld	a,(v_log2spc) : or a : jr z,.rabr		; log2spc==0 -> только >>1
+	ld	b,a
 .rab	ld	hl,v_bytesavail : call shl32_1 : djnz .rab
+.rabr	ld	hl,v_bytesavail : call shr32_1
 	ld	hl,v_free       : ld de,txt_aunits : ld b,11 : call fmt_dec32
 	ld	hl,v_bytesavail : ld de,txt_avail  : ld b,11 : call fmt_dec32
 .skiplost
@@ -1323,20 +1331,20 @@ txt_scan_t2 db	"     "
 txt_wnd	db	#0E, "Volume report", #0D, #0D
 	db	" "
 txt_space  db	"           "		; поле 11 знаков
-	db	" bytes total disk space", #0D
+	db	" KB total disk space", #0D
 	db	" "
 txt_dirbytes db	"           "
-	db	" bytes in "
+	db	" KB in "
 txt_dircnt db	"     "			; поле 5 знаков
 	db	" directories", #0D
 	db	" "
 txt_filebytes db "           "
-	db	" bytes in "
+	db	" KB in "
 txt_filecnt db	"     "
 	db	" user files", #0D
 	db	" "
 txt_avail  db	"           "
-	db	" bytes available on disk", #0D, #0D
+	db	" KB available on disk", #0D, #0D
 	db	" "
 txt_unit   db	"           "
 	db	" bytes in each allocation unit", #0D

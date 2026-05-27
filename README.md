@@ -20,10 +20,10 @@ SD-карту через хардварный SPI-контроллер (Z-Contro
 ```
                  Volume report
 
-  103201792 bytes total disk space
-      34304 bytes in    18 directories
-   59819748 bytes in   535 user files
-   43227136 bytes available on disk
+     100783 KB total disk space
+         33 KB in    18 directories
+      58417 KB in   535 user files
+      42214 KB available on disk
 
         512 bytes in each allocation unit
      201566 total allocation units
