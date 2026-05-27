@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Damage the media descriptor of BOTH FATs identically, to test ChkDsk's
-"both FAT headers bad" detection.
+"""Одинаково испортить media-дескриптор ОБЕИХ копий FAT — для проверки детекта
+ChkDsk «обе копии заголовка FAT битые».
 
-Sets FAT0[0] and FAT1[0] low byte to 0x55 (!= BPB media). Both fail media_ok
-AND the copies stay identical -> backup-FAT mismatches = 0, yet ChkDsk now
-reports "BOTH FAT headers BAD - unrecoverable" (mirror repair cannot help -
-there is no good copy to restore from). This is by design unrecoverable by
-ChkDsk; use --restore to put the valid descriptor (BPB media byte) back.
+Ставит младший байт FAT0[0] и FAT1[0] в 0x55 (!= media-байту BPB). Обе копии не
+проходят media_ok И при этом остаются идентичными → backup-FAT mismatches = 0, но
+ChkDsk сообщает «BOTH FAT headers BAD - unrecoverable» (зеркальный ремонт не помогает
+— нет хорошей копии-источника). Это by-design невосстановимо зеркалом; `--restore`
+возвращает корректный дескриптор (media-байт из BPB).
 
-Usage:
-    python make_fat_both_bad.py [--img PATH]            # damage both FAT headers
-    python make_fat_both_bad.py [--img PATH] --restore  # restore valid descriptor
+Запуск:
+    python make_fat_both_bad.py [--img PATH]            # испортить оба заголовка FAT
+    python make_fat_both_bad.py [--img PATH] --restore  # вернуть корректный дескриптор
 """
 import argparse
 import struct
@@ -30,10 +30,10 @@ def main():
     args = ap.parse_args()
     fi = inj.Fat32Image(Path(args.img))
 
-    media = fi.data[21]                      # BPB media descriptor (the correct FAT[0] low byte)
+    media = fi.data[21]                      # media-дескриптор BPB (корректный младший байт FAT[0])
     lowbyte = media if args.restore else 0x55
     for fat in (0, 1):
-        off = fi.fat_offset(0, fat=fat)      # FAT[fat] entry 0, low byte = media descriptor
+        off = fi.fat_offset(0, fat=fat)      # FAT[fat] запись 0, младший байт = media-дескриптор
         fi.data[off] = lowbyte
     fi.save()
 

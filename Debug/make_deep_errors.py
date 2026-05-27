@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Plant deep-check (SPACE) errors into a FAT32 image: a cross-link and a
-bad-size file. ChkDsk's deep check is DETECT-only (it reports Cross-linked /
-Bad-size, it does not repair them), so this writes a sidecar backup and can
-revert with --restore.
+"""Внести в FAT32-образ ошибки для deep check (SPACE): cross-link и файл с
+неверным размером (bad-size). Deep check в ChkDsk — ТОЛЬКО детект (показывает
+Cross-linked / Bad-size, не чинит их), поэтому скрипт пишет сайдкар-бэкап и умеет
+откатываться через --restore.
 
-  cross-link: splice file B's last cluster (EOC) to point at file A's first
-              cluster -> A's clusters are claimed by both chains.
-  bad-size  : grow a file's directory size field by one cluster so the chain
-              length no longer matches ceil(size / clusterSize).
+  cross-link: подменить последний кластер (EOC) файла B так, чтобы он указывал на
+              первый кластер файла A -> кластеры A заняты обеими цепочками.
+  bad-size  : увеличить поле размера файла в каталоге на один кластер, чтобы длина
+              цепочки перестала совпадать с ceil(size / clusterSize).
 
-Usage:
-    python make_deep_errors.py [--img PATH]            # plant errors
-    python make_deep_errors.py [--img PATH] --restore  # revert from sidecar
+Запуск:
+    python make_deep_errors.py [--img PATH]            # внести ошибки
+    python make_deep_errors.py [--img PATH] --restore  # откатить из сайдкара
 """
 import argparse
 import json
@@ -66,7 +66,7 @@ def main():
             return 1
         bak = json.loads(side.read_text())
         set_dir_size(fi, bak["bs_dir"], bak["bs_index"], bak["bs_orig_size"])
-        set_dir_size(fi, bak["b_dir"], bak["b_index"], bak["b_orig_size"])   # B's size (repair_size may have changed it)
+        set_dir_size(fi, bak["b_dir"], bak["b_index"], bak["b_orig_size"])   # размер B (repair_size мог его изменить)
         fi.set_fat(bak["xl_cluster"], bak["xl_orig"])
         fi.save()
         side.unlink()
@@ -78,7 +78,7 @@ def main():
         print("need >=2 files with clusters to plant errors")
         return 1
     files.sort(key=lambda f: len(f["chain"]))
-    a = files[0]                       # smallest chain -> few cross-linked clusters
+    a = files[0]                       # самая короткая цепочка -> мало cross-linked кластеров
     b = next(f for f in files if f["start"] != a["start"])
     bsf = files[-1] if files[-1]["start"] not in (a["start"], b["start"]) else b
 
@@ -87,10 +87,10 @@ def main():
            "xl_cluster": b["chain"][-1], "xl_orig": fi.get_fat(b["chain"][-1])}
     side.write_text(json.dumps(bak))
 
-    # bad-size: grow the size field by one cluster (chain unchanged)
+    # bad-size: увеличить поле размера на один кластер (цепочка не меняется)
     new_size = bsf["size"] + fi.cluster_size
     set_dir_size(fi, bsf["dir"], bsf["index"], new_size)
-    # cross-link: B's last cluster (was EOC) now points into A's chain
+    # cross-link: последний кластер B (был EOC) теперь указывает в цепочку A
     fi.set_fat(b["chain"][-1], a["start"])
     fi.save()
 

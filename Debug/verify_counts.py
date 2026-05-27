@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Independently count files/dirs in wc.img (same rules as the plugin)
-and compare against the plugin's reported numbers.
+"""Независимо посчитать файлы/каталоги в wc.img (по тем же правилам, что и плагин)
+и сравнить с числами, которые выводит плагин.
 
-Guarded against FAT cycles / cross-links (which would otherwise hang).
+Защищён от циклов FAT / cross-link (иначе завис бы).
 """
 import argparse
 import importlib.util
@@ -27,7 +27,7 @@ def main():
 
     img = m.Fat32Image(Path(args.img))
 
-    # ---- guarded cluster_chain: stop on revisit or absurd length ----
+    # ---- cluster_chain с защитой: стоп при повторном заходе или абсурдной длине ----
     orig_max = (img.total_sectors // img.spc) + 4
     def guarded_chain(start):
         chain, cur, seen = [], start, set()
@@ -65,7 +65,7 @@ def main():
                 continue
             name = img.short_to_name(e["short"])
             if attr & ATTR_DIR:
-                if name in (".", ".."):     # check BEFORE any stripping
+                if name in (".", ".."):     # проверять ДО любого срезания
                     continue
                 dirs += 1
                 walk(e["cluster"], depth + 1, path + name + "/")

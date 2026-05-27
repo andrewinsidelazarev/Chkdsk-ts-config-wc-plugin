@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Non-destructively damage FAT0 (primary FAT) so ChkDsk restores it from FAT1.
+"""Неразрушающе повредить FAT0 (первичную FAT), чтобы ChkDsk восстановил её из FAT1.
 
-Invalidates FAT0's media descriptor (FAT0[0] low byte F8 -> F0). ChkDsk's
-media_ok then fails for FAT0 (first_ok=0) while FAT1[0] stays valid (second_ok=1),
-so repair_fat_mirror takes the "!first_ok && second_ok" branch and copies FAT1
-over FAT0. Non-destructive: FAT0[0] is a reserved entry (in no cluster chain),
-F0 is a valid media type (mounts fine), and FAT1 is left fully intact.
+Делает невалидным media-дескриптор FAT0 (младший байт FAT0[0] F8 -> F0). Тогда
+media_ok в ChkDsk не проходит для FAT0 (first_ok=0), а FAT1[0] остаётся валидным
+(second_ok=1), поэтому repair_fat_mirror идёт по ветке «!first_ok && second_ok» и
+копирует FAT1 поверх FAT0. Неразрушающе: FAT0[0] — зарезервированная запись (ни в
+одной цепочке), F0 — валидный тип носителя (том монтируется), FAT1 не тронута.
 
-Usage: python make_fat0_corrupt.py [--img PATH]
+Запуск: python make_fat0_corrupt.py [--img PATH]
 """
 import argparse
 import struct
@@ -27,9 +27,9 @@ def main():
     args = ap.parse_args()
     fi = inj.Fat32Image(Path(args.img))
 
-    # Normalize first: make FAT1 an exact mirror of FAT0, so the ONLY divergence
-    # is the media descriptor we damage below (otherwise a leftover FAT1
-    # mismatch would get pulled back into FAT0 when FAT1 is used as the source).
+    # Сначала нормализуем: сделать FAT1 точной копией FAT0, чтобы ЕДИНСТВЕННЫМ
+    # расхождением был media-дескриптор, который портим ниже (иначе остаточное
+    # расхождение FAT1 затянулось бы обратно в FAT0, когда FAT1 берётся источником).
     f0 = fi.reserved * fi.bps
     f1 = (fi.reserved + fi.fat_size) * fi.bps
     flen = fi.fat_size * fi.bps
@@ -40,7 +40,7 @@ def main():
     off0 = fi.fat_offset(0, fat=0)
     off1 = fi.fat_offset(0, fat=1)
     old0 = struct.unpack_from("<I", fi.data, off0)[0]
-    new0 = old0 & 0xFFFFFF00                     # low byte 0x00 = invalid media descriptor -> media_ok fails
+    new0 = old0 & 0xFFFFFF00                     # младший байт 0x00 = невалидный media -> media_ok не проходит
     put32(fi.data, off0, new0)
     fi.save()
 

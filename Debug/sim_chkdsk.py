@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Deterministic Z80 harness for the ChkDsk plugin routines.
+"""Детерминированный Z80-харнесс для процедур плагина ChkDsk.
 
-Uses the bundled pure-Python cburbridge Z80 core (copied locally into
-_z80_lib_cburbridge). Loads the assembled CHKDSK.WMF code at #8000 and
-can call/run routines with an instruction limit, so hangs (e.g. the
-add32 B-clobber infinite loop) surface as a TimeoutError instead of a
-round-trip through Unreal.
+Использует приложенное чистое Python-ядро Z80 от cburbridge (скопировано локально в
+_z80_lib_cburbridge). Грузит собранный код CHKDSK.WMF по #8000 и умеет
+вызывать/прогонять процедуры с лимитом инструкций, так что зависания (например,
+бесконечный цикл из-за затирания B в add32) всплывают как TimeoutError, а не как
+круг через Unreal.
 
-Pure-logic tests only (fmt_dec32, geometry compute). SD I/O is mocked
-minimally; the BPB is injected directly for the geometry test.
+Только логические тесты (fmt_dec32, расчёт геометрии). SD-ввод/вывод замокан
+минимально; BPB впрыскивается напрямую для теста геометрии.
 """
 from __future__ import annotations
 import contextlib
@@ -34,14 +34,14 @@ def parse_sym(path: Path) -> dict:
 
 
 import os
-# Fast by default: small synthetic test.img (~2s harness vs ~8min on wc.img).
-# Set CHKDSK_IMG=...\wc.img for the final real-disk verification run.
+# По умолчанию быстро: маленький синтетический test.img (~2с харнесс vs ~8мин на wc.img).
+# Для финальной проверки на реальном диске: CHKDSK_IMG=...\wc.img.
 IMG = Path(os.environ.get("CHKDSK_IMG", str(Path(__file__).resolve().parent / "test.img")))
 
 
 def expected_free(img: Path):
-    """Live FAT free-cluster ground truth (changes whenever the plugin
-    file is re-injected, since that re-allocates its clusters)."""
+    """Живой эталон свободных кластеров из FAT (меняется при каждом перевнедрении
+    плагина, т.к. это переаллоцирует его кластеры)."""
     with open(img, "rb") as f:
         d = f.read(512)
         spc, resv, nfat = d[13], struct.unpack_from("<H", d, 14)[0], d[16]
@@ -51,12 +51,12 @@ def expected_free(img: Path):
         fat = f.read(fatsz * 512)
     free = sum(1 for c in range(2, total + 2)
                if (struct.unpack_from("<I", fat, c * 4)[0] & 0x0FFFFFFF) == 0)
-    return free, free * spc // 2          # available КБ = free*spc*512/1024 = free*spc/2
+    return free, free * spc // 2          # доступно КБ = free*spc*512/1024 = free*spc/2
 
 
 def expected_lost(img: Path):
-    """Lost allocation units (allocated - size-based-used), matching the
-    plugin's cheap method (exact when files are well-formed)."""
+    """Потерянные единицы размещения (allocated - used-по-размеру), как считает дешёвый
+    метод плагина (точно, когда файлы корректны)."""
     import importlib.util as iu
     sp = iu.spec_from_file_location("inj", HERE.parent / "inject_chkdsk_to_wc_img.py")
     inj = iu.module_from_spec(sp); sp.loader.exec_module(inj)
@@ -91,7 +91,7 @@ def expected_lost(img: Path):
 
 
 def reachable_set(img: Path):
-    """Set of all clusters reachable from root via dir+file chains."""
+    """Множество всех кластеров, достижимых от корня по цепочкам каталогов и файлов."""
     import importlib.util as iu
     sp = iu.spec_from_file_location("inj", HERE.parent / "inject_chkdsk_to_wc_img.py")
     inj = iu.module_from_spec(sp); sp.loader.exec_module(inj)
@@ -118,7 +118,7 @@ def reachable_set(img: Path):
 
 
 def expected_walk(img: Path):
-    """Live dir-tree ground truth: (files, fileKB, dirs, dirKB).
+    """Живой эталон обхода дерева: (файлы, файлыКБ, каталоги, каталогиКБ).
     Размеры в КБ, как их теперь выводит плагин (filebytes>>10; dirclus*spc/2)."""
     import importlib.util as iu
     sp = iu.spec_from_file_location("inj", HERE.parent / "inject_chkdsk_to_wc_img.py")
@@ -151,11 +151,11 @@ class Sim:
         self.reg = registers.Registers()
         with contextlib.redirect_stdout(io.StringIO()):
             self.ins = instructions.InstructionSet(self.reg)
-        code = wmf.read_bytes()[512:]            # skip 512-byte header
+        code = wmf.read_bytes()[512:]            # пропустить 512-байтный заголовок
         self.mem[0x8000:0x8000 + len(code)] = code
-        self.mem[0x6006] = 0xC9                  # _WCAPI -> RET (mock WC API as no-op)
+        self.mem[0x6006] = 0xC9                  # _WCAPI -> RET (API WC замокан как no-op)
         self.reg.SP = 0xBF00
-        # SD (Z-Controller) mock backed by wc.img
+        # мок SD (Z-Controller) поверх wc.img
         self.sdf = open(img, "r+b" if writable else "rb") if img else None
         self.cs = False
         self.cmd = []
@@ -164,7 +164,7 @@ class Sim:
         self.wbuf = []
         self.wsector = 0
 
-    # --- SD mock: ports #77 (CS) / #57 (data) ---
+    # --- мок SD: порты #77 (CS) / #57 (данные) ---
     def in_port(self, port):
         if (port & 0xFF) == 0x57:
             return self.rq.pop(0) if self.rq else 0xFF
@@ -179,21 +179,21 @@ class Sim:
             return
         if low != 0x57 or not self.cs:
             return
-        if self.wmode == "token":                # waiting for data-start token
+        if self.wmode == "token":                # ждём токен начала данных
             if val in (0xFE, 0xFC):
                 self.wmode = "data"; self.wbuf = []
-            return                               # ignore #FF / stop token #FD
-        if self.wmode == "data":                 # collecting 512 data bytes
+            return                               # игнор #FF / стоп-токен #FD
+        if self.wmode == "data":                 # собираем 512 байт данных
             self.wbuf.append(val)
             if len(self.wbuf) == 512:
                 self.sdf.seek(self.wsector * 512)
                 self.sdf.write(bytes(self.wbuf))
                 self.wsector += 1
-                self.wmode = "token"             # ready for next block (multi-write)
-                self.rq = [0x05, 0xFF]           # data accepted, busy-done
+                self.wmode = "token"             # готов к следующему блоку (multi-write)
+                self.rq = [0x05, 0xFF]           # данные приняты, busy-done
             return
         if val == 0xFF and not self.cmd:
-            return                               # leading dummy clock
+            return                               # ведущий dummy-clock
         self.cmd.append(val)
         if len(self.cmd) == 6:
             self._sd_command(self.cmd)
@@ -203,24 +203,24 @@ class Sim:
         cmd = c[0]
         addr = (c[1] << 24) | (c[2] << 16) | (c[3] << 8) | c[4]
         if cmd == 0x52:                          # CMD18 multi-block read
-            sector = addr // 512                 # byte addressing (SDBSF=0)
+            sector = addr // 512                 # байтовая адресация (SDBSF=0)
             self.sdf.seek(sector * 512)
             data = self.sdf.read(512)
-            self.rq = [0x00, 0xFE] + list(data)  # R1, data token, 512 bytes
+            self.rq = [0x00, 0xFE] + list(data)  # R1, токен данных, 512 байт
         elif cmd == 0x59:                        # CMD25 multi-block write
             self.wsector = addr // 512
             self.wmode = "token"
-            self.rq = [0x00]                     # R1 to CMD25
+            self.rq = [0x00]                     # R1 на CMD25
         elif cmd == 0x4C:                        # CMD12 stop
             self.rq = [0x00]
 
-    # memory helpers
+    # помощники памяти
     def rd(self, a, n): return bytes(self.mem[a:a + n])
     def wr(self, a, data): self.mem[a:a + len(data)] = data
     def w16(self, a, v): self.mem[a] = v & 0xFF; self.mem[a + 1] = (v >> 8) & 0xFF
     def u32(self, a): return struct.unpack_from("<I", self.mem, a)[0]
 
-    # ref / ports
+    # ссылки / порты
     def _read_ref(self, ref):
         if ref >= 0x10000:
             return self.in_port(ref & 0xFFFF)
@@ -267,7 +267,7 @@ def main():
     wmf = HERE.parent / "src" / "CHKDSK.WMF"
     ok = True
 
-    # --- Test 1: fmt_dec32 (decimal formatting) ---
+    # --- Тест 1: fmt_dec32 (десятичное форматирование) ---
     print("=== fmt_dec32 ===")
     SRC, FLD, W = 0x9000, 0x9010, 11
     for v in (0, 10, 99, 512, 201566, 103201792, 4294967295):
@@ -281,10 +281,10 @@ def main():
             ok = False
         print(f"  {v:>11} -> '{out}'  [{status}]")
 
-    # (Test 2 geometry-from-bpb_ready skipped: redundant with Test 3 and the
-    #  FAT-mirror check doubles scan time. Full flow below covers it.)
+    # (Тест 2 «геометрия из bpb_ready» пропущен: дублирует Тест 3, а сверка зеркала
+    #  FAT удваивает время скана. Полный flow ниже его покрывает.)
 
-    # --- Test 3: full flow via SD mock (PC=#8000, reads wc.img) ---
+    # --- Тест 3: полный flow через мок SD (PC=#8000, читает wc.img) ---
     print("=== full flow via SD mock (PC=#8000 -> .show) ===")
     try:
         sim = Sim(wmf, img=IMG)
@@ -297,14 +297,14 @@ def main():
                 print(f"  {label}: '{sim.rd(sym[label], 11).decode('latin1')}'")
         free = sim.u32(sym["v_free"])
         avail = sim.u32(sym["v_bytesavail"])
-        exp_free, exp_avail = expected_free(IMG)   # computed live (injects change it)
+        exp_free, exp_avail = expected_free(IMG)   # считается вживую (внедрения меняют его)
         print(f"  v_free={free} (expect {exp_free})   v_bytesavail(KB)={avail} (expect {exp_avail})")
         if (free, avail) != (exp_free, exp_avail):
             ok = False
             print("  FAIL: FAT free-scan mismatch")
         else:
             print("  OK: FAT free-scan matches live ground truth")
-        # dir-walk results
+        # результаты обхода дерева
         fc = sim.u32(sym["v_filecnt"]); fb = sim.u32(sym["v_filebytes"])
         dc = sim.u32(sym["v_dircnt"]); db_ = sim.u32(sym["v_dirbytes"])
         ef, efb, ed, edb = expected_walk(IMG)
@@ -315,7 +315,7 @@ def main():
             print("  FAIL: dir-walk mismatch")
         else:
             print("  OK: dir-walk matches live ground truth")
-        # lost clusters
+        # потерянные кластеры
         lost = sim.u32(sym["v_lost"]); elost = expected_lost(IMG)
         print(f"  lost={lost} (exp {elost})")
         if lost != elost:
@@ -323,7 +323,7 @@ def main():
             print("  FAIL: lost-cluster mismatch")
         else:
             print("  OK: lost-cluster count matches")
-        # backup-FAT (mirror) mismatch
+        # рассинхрон зеркала (резервной FAT)
         fatmis = sim.u32(sym["v_fatmis"])
         print(f"  fatmis={fatmis} (exp 0, FAT0==FAT1 on this image)")
         if fatmis != 0:
@@ -335,15 +335,15 @@ def main():
         ok = False
         print(f"  {type(e).__name__}: {e}")
 
-    # --- Test 4: repair (free lost clusters) on a writable COPY ---
+    # --- Тест 4: ремонт (освобождение потерянных кластеров) на ЗАПИСЫВАЕМОЙ КОПИИ ---
     print("=== repair: free lost clusters on a writable copy ===")
     try:
         import shutil
         copy = HERE / "test_repair.img"
         shutil.copy(IMG, copy)
-        ef0, efb0, ed0, edb0 = expected_walk(copy)     # tree before
+        ef0, efb0, ed0, edb0 = expected_walk(copy)     # дерево до
         free0, _ = expected_free(copy)
-        reach0 = reachable_set(copy)                    # clusters that must survive
+        reach0 = reachable_set(copy)                    # кластеры, которые обязаны уцелеть
 
         def read_fat(p):
             with open(p, "rb") as f:
@@ -360,7 +360,7 @@ def main():
         sim.call(sym["repair_lost"], max_steps=20_000_000)
         recovered = sim.u32(sym["v_recovered"])
         sim.sdf.flush()
-        ef1, efb1, ed1, edb1 = expected_walk(copy)      # tree after (re-read written FAT)
+        ef1, efb1, ed1, edb1 = expected_walk(copy)      # дерево после (перечитываем записанную FAT)
         free1, _ = expected_free(copy)
         lost1 = expected_lost(copy)
         with open(copy, "rb") as f:
@@ -371,8 +371,8 @@ def main():
         print(f"  lost_before={lost_before}  recovered={recovered}")
         print(f"  tree before files={ef0} dirs={ed0} fb={efb0}  after files={ef1} dirs={ed1} fb={efb1}")
         print(f"  free before={free0} after={free1} (expect +{lost_before})  lost after={lost1} (expect 0)")
-        # rigorous: every reachable cluster's FAT entry must be UNCHANGED;
-        # every changed entry must have gone nonzero->0 and be unreachable.
+        # строго: запись FAT каждого достижимого кластера обязана быть НЕИЗМЕНЁННОЙ;
+        # каждая изменённая запись обязана была стать ненулевая->0 и быть недостижимой.
         fatB = read_fat(copy)
         reach_unchanged = all(
             fatA[c * 4:c * 4 + 4] == fatB[c * 4:c * 4 + 4] for c in reach0)

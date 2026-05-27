@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Build a SMALL FAT32 image (test.img) for fast harness runs.
-~512 KB, 512-byte clusters, a couple files + a subdir + deliberately
-orphaned (lost) clusters. The plugin's loose FAT32 validation accepts
-it even though the cluster count is below the strict FAT32 minimum.
+"""Собрать МАЛЕНЬКИЙ FAT32-образ (test.img) для быстрых прогонов харнесса.
+~512 КБ, кластеры по 512 байт, пара файлов + подкаталог + намеренно
+осиротевшие (lost) кластеры. Нестрогая валидация FAT32 в плагине принимает его,
+хотя число кластеров ниже строгого минимума FAT32.
 """
 import struct
 from pathlib import Path
@@ -11,10 +11,10 @@ SEC = 512
 SPC = 1
 RESV = 32
 NFAT = 2
-FATSZ = 8                     # FAT sectors -> 1024 entries
+FATSZ = 8                     # секторов FAT -> 1024 записи
 DATACLUS = 1000
 TOTSEC = RESV + NFAT * FATSZ + DATACLUS
-DATA0 = RESV + NFAT * FATSZ   # first data sector (cluster 2)
+DATA0 = RESV + NFAT * FATSZ   # первый сектор данных (кластер 2)
 EOC = 0x0FFFFFFF
 
 img = bytearray(TOTSEC * SEC)
@@ -28,7 +28,7 @@ struct.pack_into("<H", img, 14, RESV)
 img[16] = NFAT
 struct.pack_into("<I", img, 32, TOTSEC)
 struct.pack_into("<I", img, 36, FATSZ)
-struct.pack_into("<I", img, 44, 2)        # root cluster
+struct.pack_into("<I", img, 44, 2)        # кластер корня
 struct.pack_into("<H", img, 48, 1)        # FSInfo
 img[82:90] = b"FAT32   "
 img[510] = 0x55
@@ -64,25 +64,25 @@ def dirent(off, name, attr, clus, size):
     struct.pack_into("<I", img, off + 28, size)
 
 
-root = alloc(1)                          # cluster 2
+root = alloc(1)                          # кластер 2
 roff = clus_off(root[0])
-# file: HELLO.TXT (1100 bytes -> 3 clusters)
+# файл: HELLO.TXT (1100 байт -> 3 кластера)
 f1 = alloc(3)
 for c in f1:
     img[clus_off(c):clus_off(c) + 512] = b"H" * 512
 dirent(roff + 0, "HELLO   TXT", 0x20, f1[0], 1100)
-# subdir: SUBDIR (1 cluster)
+# подкаталог: SUBDIR (1 кластер)
 sd = alloc(1)
 dirent(roff + 32, "SUBDIR     ", 0x10, sd[0], 0)
 soff = clus_off(sd[0])
 dirent(soff + 0, ".          ", 0x10, sd[0], 0)
 dirent(soff + 32, "..         ", 0x10, 0, 0)
-# file in subdir: A.BIN (2000 bytes -> 4 clusters)
+# файл в подкаталоге: A.BIN (2000 байт -> 4 кластера)
 fa = alloc(4)
 for c in fa:
     img[clus_off(c):clus_off(c) + 512] = b"\xAA" * 512
 dirent(soff + 64, "A       BIN", 0x20, fa[0], 2000)
-# extra empty subdirs in root (to exercise BFS-queue overflow); EXTRA_DIRS env
+# лишние пустые подкаталоги в корне (чтобы провоцировать переполнение BFS-очереди); env EXTRA_DIRS
 import os
 extra = int(os.environ.get("EXTRA_DIRS", "0"))
 for i in range(extra):
@@ -92,7 +92,7 @@ for i in range(extra):
     dirent(so + 0, ".          ", 0x10, d[0], 0)
     dirent(so + 32, "..         ", 0x10, 0, 0)
 
-# LOST chain: 5 clusters allocated but referenced by nothing
+# LOST-цепочка: 5 кластеров заняты, но ни на что не ссылаются
 lost = alloc(5)
 
 Path(__file__).resolve().parent.joinpath("test.img").write_bytes(img)

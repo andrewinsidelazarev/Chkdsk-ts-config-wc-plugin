@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Corrupt FAT1 (the backup FAT) in a few sectors to test ChkDsk's FAT-mirror repair.
+"""Испортить несколько секторов FAT1 (резервной копии FAT) — для проверки
+зеркального ремонта FAT в ChkDsk.
 
-Writes wrong entries into FAT1 ONLY (FAT0 untouched) -> N differing FAT sectors
--> ChkDsk reports N "backup-FAT mismatches", and ENTER=repair copies FAT0 over
-FAT1 (FAT0[0] media descriptor stays valid -> FAT0 is the chosen good source).
+Пишет неверные записи ТОЛЬКО в FAT1 (FAT0 не трогает) → N расходящихся секторов FAT
+→ ChkDsk сообщает N «backup-FAT mismatches», а ENTER=repair копирует FAT0 поверх
+FAT1 (media-дескриптор FAT0[0] остаётся валидным → FAT0 выбирается как хороший
+источник).
 
-ChkDsk counts mismatches PER SECTOR (cmp_fat_mirror), so each corrupted sector
-adds exactly 1. We touch one entry in each of N distinct FAT sectors.
+ChkDsk считает расхождения ПОСЕКТОРНО (cmp_fat_mirror), поэтому каждый испорченный
+сектор добавляет ровно 1. Трогаем по одной записи в каждом из N разных секторов FAT.
 
-Usage: python make_fat_mismatch.py [--img PATH] [--sectors N]
+Запуск: python make_fat_mismatch.py [--img PATH] [--sectors N]
 """
 import argparse
 import importlib.util as iu
@@ -20,7 +22,7 @@ inj = iu.module_from_spec(_sp)
 _sp.loader.exec_module(inj)
 put32 = inj.put32
 
-ENTRIES_PER_SECTOR = 128                  # 512 bytes / 4 bytes per FAT32 entry
+ENTRIES_PER_SECTOR = 128                  # 512 байт / 4 байта на запись FAT32
 
 
 def main():
@@ -32,10 +34,10 @@ def main():
     fi = inj.Fat32Image(Path(args.img))
     done = []
     for k in range(1, args.sectors + 1):
-        c = ENTRIES_PER_SECTOR * k + 7    # cluster in a distinct FAT sector (skip sector 0 = media desc)
-        fat0 = fi.get_fat(c)              # FAT0 value (left untouched)
+        c = ENTRIES_PER_SECTOR * k + 7    # кластер в отдельном секторе FAT (минуем сектор 0 = media desc)
+        fat0 = fi.get_fat(c)              # значение FAT0 (не трогаем)
         bad = 0x0FFFFFF7 if (fat0 & 0x0FFFFFFF) != 0x0FFFFFF7 else 0x00000001
-        put32(fi.data, fi.fat_offset(c, fat=1), bad)   # write FAT1 entry ONLY -> diverges from FAT0
+        put32(fi.data, fi.fat_offset(c, fat=1), bad)   # пишем ТОЛЬКО запись FAT1 -> расходится с FAT0
         done.append((c, c // ENTRIES_PER_SECTOR, fat0, bad))
     fi.save()
 

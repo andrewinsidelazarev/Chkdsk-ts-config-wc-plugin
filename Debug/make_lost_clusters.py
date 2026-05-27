@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Inject artificial LOST clusters into a FAT32 wc.img to test ChkDsk repair.
+"""Внести искусственные ПОТЕРЯННЫЕ (lost) кластеры в FAT32 wc.img для проверки
+ремонта ChkDsk.
 
-A "lost cluster" = a FAT entry marked allocated (non-zero) that NO directory
-entry references -> ChkDsk must reclaim it.
+«Потерянный кластер» = запись FAT помечена занятой (ненулевая), но НИ ОДНА запись
+каталога на неё не ссылается -> ChkDsk обязан её освободить.
 
-Marks chains in BOTH ChkDsk windows so the windowed repair is exercised:
-  - one chain in the HIGH part of window 0 (cluster > 65536) -> exercises the
-    17-bit bm_addr path (clusters 65536..131071 of a 131072-cluster window),
-  - one chain in window 1 (cluster >= 131072) if the disk is that large,
-  - one single-cluster (EOC) chain low in window 0.
+Метит цепочки в ОБОИХ окнах ChkDsk, чтобы задействовать оконный ремонт:
+  - одну цепочку в ВЕРХНЕЙ части окна 0 (кластер > 65536) -> проверяет 17-битный
+    путь bm_addr (кластеры 65536..131071 окна на 131072 кластера),
+  - одну цепочку в окне 1 (кластер >= 131072), если диск достаточно большой,
+  - одну одиночную (EOC) цепочку внизу окна 0.
 
-All FAT copies are updated together, so NO backup-FAT mismatch is introduced
-(only lost clusters). Reversible: ChkDsk's ENTER=repair frees them again.
+Все копии FAT обновляются вместе, поэтому рассинхрон зеркала НЕ вносится (только
+потерянные кластеры). Обратимо: ENTER=repair в ChkDsk освободит их обратно.
 
-Usage: python make_lost_clusters.py [--img PATH]
+Запуск: python make_lost_clusters.py [--img PATH]
 """
 import argparse
 import importlib.util as iu
@@ -24,7 +25,7 @@ _sp = iu.spec_from_file_location("inj", HERE.parent / "inject_chkdsk_to_wc_img.p
 inj = iu.module_from_spec(_sp)
 _sp.loader.exec_module(inj)
 EOC = inj.EOC
-WINDOW = 131072                      # ChkDsk WINDOW_CLUSTERS (must match the build)
+WINDOW = 131072                      # WINDOW_CLUSTERS в ChkDsk (должно совпадать со сборкой)
 
 
 def last_cluster_plus1(fi):

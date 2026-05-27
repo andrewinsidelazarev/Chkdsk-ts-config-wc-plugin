@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Full Z80 verification of repair_lost on a COPY of the real wc.img.
-Definitive safety check before any on-disk repair: confirms the actual
-Z80 implementation frees exactly the orphaned clusters and leaves every
-reachable cluster (file/dir chains) untouched, on real 201566-cluster data.
-The real wc.img is never written (we operate on wc_repair_test.img).
-Slow (~30-40 min) - run in background.
+"""Полная Z80-верификация repair_lost на КОПИИ реального wc.img.
+Окончательная проверка безопасности перед любым ремонтом на диске: подтверждает,
+что фактическая Z80-реализация освобождает РОВНО осиротевшие кластеры и не трогает
+ни одного достижимого кластера (цепочки файлов/каталогов) на реальных данных из
+201566 кластеров. Сам wc.img никогда не пишется (работаем на wc_repair_test.img).
+Медленно (~30-40 мин) — запускать в фоне.
 """
 import importlib.util, struct, shutil, time
 from pathlib import Path
