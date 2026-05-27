@@ -205,12 +205,14 @@ PLUGIN:
 
 	; --- занести остальные числа и перерисовать отчёт ---
 	ld	hl,v_dirbytes   : ld de,txt_dirbytes  : ld b,11 : call fmt_dec32
-	ld	hl,v_dircnt     : ld de,txt_dircnt    : ld b,5  : call fmt_dec32
-	; v_filebytes накоплен в байтах -> перевести в КБ (>>10) перед выводом
+	ld	hl,v_dircnt     : ld de,txt_dircnt    : ld b,7  : call fmt_dec32
+	; v_filebytes уже в КБ; свернуть в него КБ из накопленного остатка байт (filerem>>10) -> точный итог
+	ld	hl,v_tmp : ld de,v_filerem : call copy32
 	ld	b,10
-.fbkb	ld	hl,v_filebytes : call shr32_1 : djnz .fbkb
+.fbkb	ld	hl,v_tmp : call shr32_1 : djnz .fbkb		; v_tmp = filerem >> 10
+	ld	hl,v_filebytes : ld de,v_tmp : call add32		; filebytes(КБ) += остаток_КБ (выполняется один раз)
 	ld	hl,v_filebytes  : ld de,txt_filebytes : ld b,11 : call fmt_dec32
-	ld	hl,v_filecnt    : ld de,txt_filecnt   : ld b,5  : call fmt_dec32
+	ld	hl,v_filecnt    : ld de,txt_filecnt   : ld b,7  : call fmt_dec32
 	ld	hl,v_bytesavail : ld de,txt_avail     : ld b,11 : call fmt_dec32
 	ld	hl,v_free       : ld de,txt_aunits    : ld b,11 : call fmt_dec32
 	ld	hl,v_lost       : ld de,txt_lost      : ld b,11 : call fmt_dec32
@@ -377,6 +379,7 @@ cmp_fat_mirror:
 dir_walk:
 	ld	hl,v_filecnt   : call zero32
 	ld	hl,v_filebytes : call zero32
+	ld	hl,v_filerem   : call zero32
 	ld	hl,v_dircnt    : call zero32
 	ld	hl,v_dirclus   : call zero32
 	ld	hl,v_expused   : call zero32
@@ -458,7 +461,15 @@ parse_dir_sector:
 	ld	a,(ix+29) : ld (v_tmp+1),a
 	ld	a,(ix+30) : ld (v_tmp+2),a
 	ld	a,(ix+31) : ld (v_tmp+3),a
-	ld	hl,v_filebytes : ld de,v_tmp : call add32
+	; filebytes: копим КБ (size>>10) + остаток байт (size & 0x3FF) — без переполнения 32-бит на >4 ГБ контента
+	ld	hl,v_tmp2 : ld de,v_tmp : call copy32
+	ld	a,(v_tmp2+1) : and 3 : ld (v_tmp2+1),a		; v_tmp2 = size & 0x3FF (младшие 10 бит)
+	xor	a : ld (v_tmp2+2),a : ld (v_tmp2+3),a
+	ld	hl,v_filerem : ld de,v_tmp2 : call add32		; filerem += остаток (< 1024 на файл)
+	ld	hl,v_tmp2 : ld de,v_tmp : call copy32
+	ld	b,10
+.fbk	ld	hl,v_tmp2 : call shr32_1 : djnz .fbk		; v_tmp2 = size >> 10 (КБ, целая часть)
+	ld	hl,v_filebytes : ld de,v_tmp2 : call add32		; filebytes(КБ) += size>>10
 	; expused += ceil(size / clusterSize)  (у корректного файла длина цепочки == этому)
 	ld	hl,v_tmp2 : ld de,v_tmp  : call copy32
 	ld	hl,v_tmp2 : ld de,v_csm1 : call add32	; + (clusterSize-1) для округления вверх
@@ -1417,7 +1428,8 @@ c2		db	2,0,0,0		; константа 2 (кластеры нумеруются с
 v_rootclus	ds	4		; кластер корневого каталога
 v_spc		db	0		; секторов на кластер (SPC)
 v_filecnt	ds	4		; счётчик файлов
-v_filebytes	ds	4		; суммарный размер файлов в байтах
+v_filebytes	ds	4		; суммарный размер файлов в КБ (целая часть; копится из size>>10)
+v_filerem	ds	4		; сумма остатков байт (size & 0x3FF); при выводе добавляется как >>10 КБ
 v_dircnt	ds	4		; счётчик каталогов
 v_dirclus	ds	4		; счётчик кластеров каталогов
 v_dirbytes	ds	4		; байт в каталогах
@@ -1539,12 +1551,12 @@ txt_space  db	"           "		; поле 11 знаков
 	db	" "
 txt_dirbytes db	"           "
 	db	" KB in "
-txt_dircnt db	"     "			; поле 5 знаков
+txt_dircnt db	"       "		; поле 7 знаков (до 9999999)
 	db	" directories", #0D
 	db	" "
 txt_filebytes db "           "
 	db	" KB in "
-txt_filecnt db	"     "
+txt_filecnt db	"       "		; поле 7 знаков (до 9999999)
 	db	" user files", #0D
 	db	" "
 txt_avail  db	"           "
